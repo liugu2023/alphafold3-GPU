@@ -428,32 +428,54 @@ def predict_structure_on_gpu(
         model_dir=model_dir
     )
     
+    print(f'Featurising data with {len(fold_input.rng_seeds)} seed(s)...')
+    featurisation_start_time = time.time()
+    ccd = chemical_components.cached_ccd(user_ccd=fold_input.user_ccd)
+    featurised_examples = featurisation.featurise_input(
+        fold_input=fold_input,
+        buckets=buckets,
+        ccd=ccd,
+        verbose=True,
+        conformer_max_iterations=conformer_max_iterations,
+    )
+    print(
+        f'Featurising data with {len(fold_input.rng_seeds)} seed(s) took'
+        f' {time.time() - featurisation_start_time:.2f} seconds.'
+    )
+    
     # 运行预测
     results = []
-    for seed in fold_input.rng_seeds:
+    for seed, example in zip(fold_input.rng_seeds, featurised_examples):
         print(f'Running inference for seed {seed}...')
-        example = featurise_input(fold_input, seed)
         rng_key = jax.random.PRNGKey(seed)
         
         # 运行推理
         result = model_runner.run_inference(example, rng_key)
         
-        # 如果需要，运行构象生成
-        if conformer_max_iterations is not None:
-            result = run_conformer_generation(
-                result=result,
-                max_iterations=conformer_max_iterations,
-            )
+        # 提取结构
+        print(f'Extracting output structure samples with seed {seed}...')
+        extract_structures = time.time()
+        inference_results = model_runner.extract_structures(
+            batch=example, result=result, target_name=fold_input.name
+        )
+        print(
+            f'Extracting {len(inference_results)} output structure samples with'
+            f' seed {seed} took {time.time() - extract_structures:.2f} seconds.'
+        )
         
-        results.append(ResultsForSeed(seed=seed, result=result))
+        # 提取embeddings
+        embeddings = model_runner.extract_embeddings(result)
+        
+        results.append(
+            ResultsForSeed(
+                seed=seed,
+                inference_results=inference_results,
+                full_fold_input=fold_input,
+                embeddings=embeddings,
+            )
+        )
     
-    # 确保结果在CPU上
-    results = [(r.seed, jax.tree_util.tree_map(
-        lambda x: np.array(x) if isinstance(x, (np.ndarray, jnp.ndarray)) else x,
-        r.result
-    )) for r in results]
-    
-    return [ResultsForSeed(seed=s, result=r) for s, r in results]
+    return results
 
 def predict_structure(
     fold_input: folding_input.Input,
