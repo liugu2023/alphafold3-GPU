@@ -760,45 +760,33 @@ class DynamicGPUModelRunner(ModelRunner):
     
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self._main_gpu = _MAIN_GPU.value
-        self._worker_gpu = _WORKER_GPU.value
+        self._devices = jax.local_devices(backend='gpu')
+        if len(self._devices) < 2:
+            raise RuntimeError(f"Need at least 2 GPUs, found {len(self._devices)}")
         
     def run_inference(self, featurised_example: features.BatchDict, rng_key: jnp.ndarray) -> model.ModelResult:
         """在适当的GPU上运行推理"""
         # 选择合适的GPU
         selected_gpu = select_gpu_for_operation()
         
-        if selected_gpu != self._main_gpu:
-            print(f"Running inference on GPU {selected_gpu}")
-            # 临时切换到选定的GPU
-            original_devices = os.environ.get('CUDA_VISIBLE_DEVICES')
-            os.environ['CUDA_VISIBLE_DEVICES'] = str(selected_gpu)
-            
-            # 重新初始化设备
-            devices = jax.local_devices(backend='gpu')
-            if not devices:
-                raise RuntimeError(f"Failed to initialize GPU {selected_gpu}")
-            
-            # 在选定的GPU上运行推理
-            result = super().run_inference(featurised_example, rng_key)
-            
-            # 恢复原始GPU设置
-            if original_devices is not None:
-                os.environ['CUDA_VISIBLE_DEVICES'] = original_devices
-            
+        if selected_gpu == self._devices[1]:
+            print(f"Running inference on worker GPU")
+            # 在worker GPU上运行
+            with jax.default_device(self._devices[1]):
+                result = super().run_inference(featurised_example, rng_key)
             # 确保数据返回到CPU内存
             result = jax.tree.map(lambda x: np.array(x), result)
-            
-            print(f"Inference completed on GPU {selected_gpu}, data transferred back to CPU")
+            print(f"Inference completed on worker GPU, data transferred back to CPU")
         else:
             # 在主GPU上运行
-            result = super().run_inference(featurised_example, rng_key)
+            with jax.default_device(self._devices[0]):
+                result = super().run_inference(featurised_example, rng_key)
         
         return result
 
 def main(_):
-    # 在最开始就设置主进程只使用 GPU 0
-    os.environ['CUDA_VISIBLE_DEVICES'] = str(_MAIN_GPU.value)
+    # 设置程序可以看到两个 GPU
+    os.environ['CUDA_VISIBLE_DEVICES'] = f"{_MAIN_GPU.value},{_WORKER_GPU.value}"
     
     if _JAX_COMPILATION_CACHE_DIR.value is not None:
         jax.config.update(
@@ -918,9 +906,11 @@ def main(_):
             devices = jax.local_devices(backend='gpu')
             if not devices:
                 raise RuntimeError("No GPU devices found")
+            if len(devices) < 2:
+                raise RuntimeError(f"Need at least 2 GPUs, found {len(devices)}")
             
             print(f'Found local devices: {devices}')
-            print(f'Main GPU: {_MAIN_GPU.value}, Worker GPU: {_WORKER_GPU.value}')
+            print(f'Main GPU: {devices[0]}, Worker GPU: {devices[1]}')
             
             # 检查模型目录
             model_path = pathlib.Path(MODEL_DIR.value)
