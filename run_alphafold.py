@@ -56,6 +56,7 @@ import psutil
 import GPUtil
 from concurrent.futures import ProcessPoolExecutor
 import torch
+import gc
 
 
 _HOME_DIR = pathlib.Path(os.environ.get('HOME'))
@@ -425,23 +426,7 @@ def predict_structure(
     print(f"GPU {main_gpu}: Used={gpu0_used:.1f}GB/Total={gpu0_total:.1f}GB (Free: {gpu0_free:.1f}GB)")
     print(f"GPU {worker_gpu}: Used={gpu1_used:.1f}GB/Total={gpu1_total:.1f}GB (Free: {gpu1_free:.1f}GB)")
     
-    # 2. 检查是否有足够显存
-    MIN_REQUIRED_MEMORY = 8.0
-    if max(gpu0_free, gpu1_free) < MIN_REQUIRED_MEMORY:
-        raise RuntimeError(
-            f"No GPU has enough free memory before starting (need at least {MIN_REQUIRED_MEMORY}GB). "
-            f"GPU {main_gpu}: {gpu0_free:.1f}GB free, GPU {worker_gpu}: {gpu1_free:.1f}GB free"
-        )
-    
-    # 3. 选择显存较多的GPU
-    selected_gpu = main_gpu if gpu0_free > gpu1_free else worker_gpu
-    print(f"\n=== GPU Selection Result ===")
-    print(f"Selected GPU {selected_gpu} with {max(gpu0_free, gpu1_free):.1f}GB free memory")
-    
-    # 4. 设置环境变量 - 只让JAX看到选中的GPU
-    os.environ['CUDA_VISIBLE_DEVICES'] = str(selected_gpu)
-    
-    # 在主进程上进行特征化
+    # 2. 在主进程上进行特征化
     print(f'\nFeaturising data with {len(fold_input.rng_seeds)} seed(s)...')
     featurisation_start_time = time.time()
     ccd = chemical_components.cached_ccd(user_ccd=fold_input.user_ccd)
@@ -455,6 +440,38 @@ def predict_structure(
     print(
         f'Featurising data took {time.time() - featurisation_start_time:.2f} seconds.'
     )
+    
+    # 3. 清理特征化过程占用的显存
+    print("\n=== Cleaning up GPU memory after featurisation ===")
+    torch.cuda.empty_cache()  # 清理PyTorch缓存
+    jax.clear_caches()        # 清理JAX缓存
+    gc.collect()              # 强制垃圾回收
+    
+    # 4. 再次检查显存状态
+    gpu0_used, gpu0_total = get_gpu_memory_info(main_gpu)
+    gpu1_used, gpu1_total = get_gpu_memory_info(worker_gpu)
+    gpu0_free = gpu0_total - gpu0_used
+    gpu1_free = gpu1_total - gpu1_used
+    
+    print("\n=== GPU Memory Status After Cleanup ===")
+    print(f"GPU {main_gpu}: Used={gpu0_used:.1f}GB/Total={gpu0_total:.1f}GB (Free: {gpu0_free:.1f}GB)")
+    print(f"GPU {worker_gpu}: Used={gpu1_used:.1f}GB/Total={gpu1_total:.1f}GB (Free: {gpu1_free:.1f}GB)")
+    
+    # 5. 检查是否有足够显存并选择GPU
+    MIN_REQUIRED_MEMORY = 8.0
+    if max(gpu0_free, gpu1_free) < MIN_REQUIRED_MEMORY:
+        raise RuntimeError(
+            f"No GPU has enough free memory after cleanup (need at least {MIN_REQUIRED_MEMORY}GB). "
+            f"GPU {main_gpu}: {gpu0_free:.1f}GB free, GPU {worker_gpu}: {gpu1_free:.1f}GB free"
+        )
+    
+    # 6. 选择显存较多的GPU
+    selected_gpu = main_gpu if gpu0_free > gpu1_free else worker_gpu
+    print(f"\n=== GPU Selection Result ===")
+    print(f"Selected GPU {selected_gpu} with {max(gpu0_free, gpu1_free):.1f}GB free memory")
+    
+    # 7. 设置环境变量 - 只让JAX看到选中的GPU
+    os.environ['CUDA_VISIBLE_DEVICES'] = str(selected_gpu)
     
     # 创建进程池用于推理
     ctx = multiprocessing.get_context('spawn')
