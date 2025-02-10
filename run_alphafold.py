@@ -407,6 +407,8 @@ class ResultsForSeed:
 def predict_structure(
     fold_input: folding_input.Input,
     model_runner: ModelRunner,
+    main_gpu: int,
+    worker_gpu: int,
     buckets: Sequence[int] | None = None,
     conformer_max_iterations: int | None = None,
 ) -> Sequence[ResultsForSeed]:
@@ -430,7 +432,7 @@ def predict_structure(
     
     # 在创建子进程前设置环境变量
     original_cuda_visible_devices = os.environ.get('CUDA_VISIBLE_DEVICES')
-    os.environ['CUDA_VISIBLE_DEVICES'] = str(_WORKER_GPU.value)
+    os.environ['CUDA_VISIBLE_DEVICES'] = str(worker_gpu)
     
     # 创建进程池用于推理
     ctx = multiprocessing.get_context('spawn')
@@ -449,7 +451,8 @@ def predict_structure(
                         rng_key,
                         model_runner._model_config,
                         model_runner._model_dir,
-                        _WORKER_GPU.value,
+                        main_gpu,
+                        worker_gpu,
                         True,
                     )
                 )
@@ -593,6 +596,8 @@ def process_fold_input(
     output_dir: os.PathLike[str] | str,
     buckets: Sequence[int] | None = None,
     conformer_max_iterations: int | None = None,
+    main_gpu: int = 0,
+    worker_gpu: int = 1,
 ) -> folding_input.Input | Sequence[ResultsForSeed]:
   """Runs data pipeline and/or inference on a single fold input.
 
@@ -609,6 +614,8 @@ def process_fold_input(
       is more than the largest bucket size.
     conformer_max_iterations: Optional override for maximum number of iterations
       to run for RDKit conformer search.
+    main_gpu: GPU device to use for the main process.
+    worker_gpu: GPU device to use for worker processes.
 
   Returns:
     The processed fold input, or the inference results for each seed.
@@ -653,6 +660,8 @@ def process_fold_input(
         model_runner=model_runner,
         buckets=buckets,
         conformer_max_iterations=conformer_max_iterations,
+        main_gpu=main_gpu,
+        worker_gpu=worker_gpu,
     )
     print(f'Writing outputs with {len(fold_input.rng_seeds)} seed(s)...')
     write_outputs(
@@ -732,6 +741,8 @@ def process_batch(
             output_dir=os.path.join(output_dir, fold_input.sanitised_name()),
             buckets=buckets,
             conformer_max_iterations=conformer_max_iterations,
+            main_gpu=main_gpu,
+            worker_gpu=worker_gpu,
         )
     print(f"Worker process completed batch")
 
@@ -780,34 +791,39 @@ def get_gpu_memory_info(gpu_id: int) -> Tuple[float, float]:
     except Exception:
         return (0, 0)
 
-def select_gpu_for_inference() -> int:
+def select_gpu_for_inference(main_gpu: int, worker_gpu: int) -> int:
     """选择显存占用率较低的GPU用于推理
+    
+    Args:
+        main_gpu: 主GPU ID
+        worker_gpu: 工作GPU ID
     
     Returns:
         int: 选择的GPU ID
     """
-    gpu0_used, gpu0_total = get_gpu_memory_info(_MAIN_GPU.value)
-    gpu1_used, gpu1_total = get_gpu_memory_info(_WORKER_GPU.value)
+    gpu0_used, gpu0_total = get_gpu_memory_info(main_gpu)
+    gpu1_used, gpu1_total = get_gpu_memory_info(worker_gpu)
     
     gpu0_usage = gpu0_used / gpu0_total if gpu0_total > 0 else 1
     gpu1_usage = gpu1_used / gpu1_total if gpu1_total > 0 else 1
     
-    print(f"GPU {_MAIN_GPU.value} memory: {gpu0_used:.1f}GB/{gpu0_total:.1f}GB ({gpu0_usage*100:.1f}%)")
-    print(f"GPU {_WORKER_GPU.value} memory: {gpu1_used:.1f}GB/{gpu1_total:.1f}GB ({gpu1_usage*100:.1f}%)")
+    print(f"GPU {main_gpu} memory: {gpu0_used:.1f}GB/{gpu0_total:.1f}GB ({gpu0_usage*100:.1f}%)")
+    print(f"GPU {worker_gpu} memory: {gpu1_used:.1f}GB/{gpu1_total:.1f}GB ({gpu1_usage*100:.1f}%)")
     
-    return _WORKER_GPU.value if gpu1_usage < gpu0_usage else _MAIN_GPU.value
+    return worker_gpu if gpu1_usage < gpu0_usage else main_gpu
 
 def run_inference_process(
     featurised_example: features.BatchDict,
     rng_key: jnp.ndarray,
     model_config: model.Model.Config,
     model_dir: pathlib.Path,
-    gpu_id: int,
+    main_gpu: int,
+    worker_gpu: int,
     is_worker_gpu: bool = False,
 ) -> model.ModelResult:
     """在显存占用较低的GPU上运行推理"""
     # 选择显存占用较低的GPU
-    target_gpu = select_gpu_for_inference()
+    target_gpu = select_gpu_for_inference(main_gpu, worker_gpu)
     print(f"Selected GPU {target_gpu} for inference")
     
     # 设置环境变量
@@ -1110,6 +1126,8 @@ def main(_):
                         output_dir=os.path.join(_OUTPUT_DIR.value, fold_input.sanitised_name()),
                         buckets=tuple(int(bucket) for bucket in _BUCKETS.value),
                         conformer_max_iterations=_CONFORMER_MAX_ITERATIONS.value,
+                        main_gpu=_MAIN_GPU.value,
+                        worker_gpu=_WORKER_GPU.value,
                     )
                     num_fold_inputs += 1
                     print(f"Processed {num_fold_inputs}/{len(fold_input_list)} inputs")
