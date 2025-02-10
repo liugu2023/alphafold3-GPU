@@ -274,6 +274,18 @@ _SAVE_EMBEDDINGS = flags.DEFINE_bool(
     'Whether to save the final trunk single and pair embeddings in the output.',
 )
 
+# 添加新的命令行参数
+_MAIN_GPU = flags.DEFINE_integer(
+    'main_gpu',
+    0,
+    'GPU device to use for the main process.',
+)
+_WORKER_GPU = flags.DEFINE_integer(
+    'worker_gpu',
+    1,
+    'GPU device to use for worker processes.',
+)
+
 
 def make_model_config(
     *,
@@ -638,10 +650,10 @@ def process_fold_input(
   return output
 
 
-def get_available_gpu_memory() -> float:
-    """获取当前可用的GPU显存(GB)"""
+def get_available_gpu_memory(gpu_id: int) -> float:
+    """获取指定GPU的可用显存(GB)"""
     try:
-        gpu = GPUtil.getGPUs()[_GPU_DEVICE.value]
+        gpu = GPUtil.getGPUs()[gpu_id]
         return gpu.memoryFree / 1024  # 转换为GB
     except Exception:
         return 0
@@ -664,7 +676,8 @@ def process_batch(
     data_pipeline_config: pipeline.DataPipelineConfig,
     model_dir: str,
     output_dir: str,
-    gpu_device: int,
+    main_gpu: int,  # 修改参数名
+    worker_gpu: int,  # 添加worker_gpu参数
     buckets: Tuple[int, ...],
     flash_attention_implementation: str,
     num_diffusion_samples: int,
@@ -679,7 +692,8 @@ def process_batch(
         data_pipeline_config: 数据管道配置
         model_dir: 模型目录
         output_dir: 输出目录
-        gpu_device: GPU设备ID
+        main_gpu: 主进程使用的GPU ID
+        worker_gpu: 工作进程使用的GPU ID
         buckets: bucket大小列表
         flash_attention_implementation: flash attention实现方式
         num_diffusion_samples: diffusion样本数量
@@ -688,6 +702,7 @@ def process_batch(
         conformer_max_iterations: RDKit构象搜索的最大迭代次数
     """
     devices = jax.local_devices(backend='gpu')
+    # 工作进程使用worker_gpu
     model_runner = ModelRunner(
         config=make_model_config(
             flash_attention_implementation=typing.cast(
@@ -697,7 +712,7 @@ def process_batch(
             num_recycles=num_recycles,
             return_embeddings=save_embeddings,
         ),
-        device=devices[gpu_device],
+        device=devices[worker_gpu],  # 使用worker_gpu
         model_dir=pathlib.Path(model_dir),
     )
     
@@ -831,8 +846,13 @@ def main(_):
       if not devices:
         raise RuntimeError("No GPU devices found")
         
-      print(f'Found local devices: {devices}, using device {_GPU_DEVICE.value}:'
-            f' {devices[_GPU_DEVICE.value]}')
+      if _MAIN_GPU.value >= len(devices) or _WORKER_GPU.value >= len(devices):
+        raise ValueError(f"Specified GPU device ID exceeds available devices. "
+                      f"Available devices: {len(devices)}")
+                
+      print(f'Found local devices: {devices}')
+      print(f'Using main GPU: {devices[_MAIN_GPU.value]}')
+      print(f'Using worker GPU: {devices[_WORKER_GPU.value]}')
       
       # 检查模型目录
       model_path = pathlib.Path(MODEL_DIR.value)
@@ -847,10 +867,10 @@ def main(_):
         # 多进程处理逻辑
         try:
           max_workers = min(psutil.cpu_count(logical=False), 8)
-          available_memory = get_available_gpu_memory()
+          available_memory = get_available_gpu_memory(_WORKER_GPU.value)  # 检查worker GPU的显存
           batch_size = estimate_batch_size(available_memory)
           
-          print(f"Available GPU memory: {available_memory:.2f}GB")
+          print(f"Available GPU memory on worker GPU: {available_memory:.2f}GB")
           print(f"Estimated batch size: {batch_size}")
           print(f"Number of workers: {max_workers}")
           
@@ -872,7 +892,8 @@ def main(_):
                       data_pipeline_config=data_pipeline_config,
                       model_dir=MODEL_DIR.value,
                       output_dir=_OUTPUT_DIR.value,
-                      gpu_device=_GPU_DEVICE.value,
+                      main_gpu=_MAIN_GPU.value,
+                      worker_gpu=_WORKER_GPU.value,  # 传入worker_gpu
                       buckets=tuple(int(bucket) for bucket in _BUCKETS.value),
                       flash_attention_implementation=_FLASH_ATTENTION_IMPLEMENTATION.value,
                       num_diffusion_samples=_NUM_DIFFUSION_SAMPLES.value,
@@ -895,7 +916,7 @@ def main(_):
           print(f"Error in multi-process execution: {str(e)}")
           raise
       else:
-        # 单进程处理逻辑
+        # 单进程处理逻辑,使用main_gpu
         try:
           print('Building model from scratch...')
           model_runner = ModelRunner(
@@ -907,7 +928,7 @@ def main(_):
                   num_recycles=_NUM_RECYCLES.value,
                   return_embeddings=_SAVE_EMBEDDINGS.value,
               ),
-              device=devices[_GPU_DEVICE.value],
+              device=devices[_MAIN_GPU.value],  # 使用main_gpu
               model_dir=pathlib.Path(MODEL_DIR.value),
           )
           print('Checking that model parameters can be loaded...')
