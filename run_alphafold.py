@@ -776,8 +776,19 @@ def run_inference_process(
     gpu_id: int,
     is_worker_gpu: bool = False,
 ) -> model.ModelResult:
-    """在独立进程中运行推理"""
+    """在独立进程中运行推理，使用预留的显存"""
     print(f"Inference process starting on GPU {gpu_id}")
+    
+    # 使用与预留显存相同的GPU上下文
+    os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
+    torch.cuda.set_device(0)  # 因为设置了CUDA_VISIBLE_DEVICES，所以这里用0
+    
+    # 设置JAX使用预留的显存区域
+    os.environ.update({
+        'XLA_PYTHON_CLIENT_MEM_FRACTION': '0.7',  # 使用预留区域的显存
+        'XLA_PYTHON_CLIENT_PREALLOCATE': 'false',  # 禁用预分配，使用已预留的显存
+        'XLA_PYTHON_CLIENT_ALLOCATOR': 'platform'  # 使用平台原生分配器
+    })
     
     # 创建模型实例
     try:
@@ -807,6 +818,8 @@ def run_inference_process(
         
     except Exception as e:
         print(f"Error in inference process: {str(e)}")
+        print(f"Current GPU memory usage: {torch.cuda.memory_allocated()/1024/1024/1024:.2f}GB")
+        print(f"Max GPU memory usage: {torch.cuda.max_memory_allocated()/1024/1024/1024:.2f}GB")
         raise
 
 class DynamicGPUModelRunner(ModelRunner):
