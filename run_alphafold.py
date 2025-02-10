@@ -752,74 +752,84 @@ def select_gpu_for_operation() -> jax.Device:
         return devices[1]
     return devices[0]
 
+def run_inference_process(
+    featurised_example: features.BatchDict,
+    rng_key: jnp.ndarray,
+    model_config: model.Model.Config,
+    model_dir: pathlib.Path,
+    gpu_id: int
+) -> model.ModelResult:
+    """在独立进程中运行推理
+    
+    Args:
+        featurised_example: 特征化的输入数据
+        rng_key: 随机数生成器密钥
+        model_config: 模型配置
+        model_dir: 模型目录
+        gpu_id: 要使用的GPU ID
+    """
+    # 设置进程使用指定的GPU
+    os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
+    print(f"Inference process starting on GPU {gpu_id}")
+    
+    # 初始化设备
+    devices = jax.local_devices(backend='gpu')
+    if not devices:
+        raise RuntimeError(f"No GPU devices found for inference process")
+    
+    # 创建模型实例
+    inference_model = ModelRunner(
+        config=model_config,
+        device=devices[0],  # 由于设置了CUDA_VISIBLE_DEVICES，这里一定是目标GPU
+        model_dir=model_dir
+    )
+    
+    # 运行推理
+    result = inference_model.run_inference(featurised_example, rng_key)
+    
+    # 确保结果在CPU上
+    result = jax.tree_util.tree_map(lambda x: np.array(x) if isinstance(x, (np.ndarray, jnp.ndarray)) else x, result)
+    return result
+
 class DynamicGPUModelRunner(ModelRunner):
-    """支持动态GPU切换的ModelRunner"""
-    
     def __init__(self, *args, **kwargs):
+        # 保存初始化参数
+        self._model_config = kwargs['config']
+        self._model_dir = kwargs['model_dir']
+        self._worker_gpu = _WORKER_GPU.value
+        
+        # 只在主GPU上初始化基础模型
+        os.environ['CUDA_VISIBLE_DEVICES'] = str(_MAIN_GPU.value)
         super().__init__(*args, **kwargs)
-        self._devices = jax.local_devices(backend='gpu')
-        if len(self._devices) < 2:
-            raise RuntimeError(f"Need at least 2 GPUs, found {len(self._devices)}")
         
-        # 存储初始化时的设备
-        self._init_device = self._devices[0]  # GPU 0 用于初始化和其他操作
-        self._inference_device = self._devices[1]  # GPU 1 专门用于推理
-        
-        print(f"Initialized model on {self._init_device}")
-        print(f"Will use {self._inference_device} for inference")
-    
     def run_inference(self, featurised_example: features.BatchDict, rng_key: jnp.ndarray) -> model.ModelResult:
-        """在GPU 1上运行推理"""
-        print(f"Running inference on {self._inference_device}")
+        """使用子进程在GPU 1上运行推理"""
+        print(f"Starting inference process on GPU {self._worker_gpu}")
         
-        # 在GPU 1上运行推理
-        with jax.default_device(self._inference_device):
-            # 创建一个新的模型实例在GPU 1上
-            inference_model_runner = ModelRunner(
-                config=self._model_config,
-                device=self._inference_device,
-                model_dir=self._model_dir
+        # 使用multiprocessing启动推理进程
+        ctx = multiprocessing.get_context('spawn')  # 使用spawn方式创建进程
+        with ctx.Pool(1) as pool:  # 只创建一个进程
+            result = pool.apply(
+                run_inference_process,
+                args=(
+                    featurised_example,
+                    rng_key,
+                    self._model_config,
+                    self._model_dir,
+                    self._worker_gpu
+                )
             )
-            
-            # 只移动数值类型的数据到GPU 1
-            def move_to_device(x):
-                try:
-                    if isinstance(x, (np.ndarray, jnp.ndarray)) and np.issubdtype(x.dtype, np.number):
-                        return jax.device_put(x, self._inference_device)
-                    return x
-                except Exception as e:
-                    print(f"Warning: Failed to move data to device: {str(e)}")
-                    return x
-            
-            # 递归处理输入数据
-            featurised_example = jax.tree_util.tree_map(move_to_device, featurised_example)
-            rng_key = jax.device_put(rng_key, self._inference_device)
-            
-            # 在GPU 1上运行推理
-            result = inference_model_runner.run_inference(featurised_example, rng_key)
-            
-            # 将结果移回CPU，以便后续在GPU 0上处理
-            def move_to_cpu(x):
-                try:
-                    if isinstance(x, (np.ndarray, jnp.ndarray)):
-                        return np.array(x)
-                    return x
-                except Exception as e:
-                    print(f"Warning: Failed to move data to CPU: {str(e)}")
-                    return x
-            
-            result = jax.tree_util.tree_map(move_to_cpu, result)
-            print(f"Inference completed on {self._inference_device}, data transferred to CPU")
         
+        print(f"Inference completed on GPU {self._worker_gpu}")
         return result
 
 def main(_):
-    # 设置程序可以看到两个 GPU
-    os.environ['CUDA_VISIBLE_DEVICES'] = f"{_MAIN_GPU.value},{_WORKER_GPU.value}"
+    # 主进程只使用GPU 0
+    os.environ['CUDA_VISIBLE_DEVICES'] = str(_MAIN_GPU.value)
     
     # 设置XLA默认不预分配全部显存
     os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
-    os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '0.5'  # 每个GPU只预分配50%显存
+    os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '0.5'
     
     if _JAX_COMPILATION_CACHE_DIR.value is not None:
         jax.config.update(
@@ -939,17 +949,15 @@ def main(_):
             devices = jax.local_devices(backend='gpu')
             if not devices:
                 raise RuntimeError("No GPU devices found")
-            if len(devices) < 2:
-                raise RuntimeError(f"Need at least 2 GPUs, found {len(devices)}")
             
-            print(f'Found local devices: {devices}')
-            print(f'Main GPU: {devices[0]}, Worker GPU: {devices[1]}')
+            print(f'Main process using GPU {_MAIN_GPU.value}')
+            print(f'Will use GPU {_WORKER_GPU.value} for inference')
             
-            # 检查两个GPU是否都可用
+            # 检查GPU是否可用
             for gpu_id in [_MAIN_GPU.value, _WORKER_GPU.value]:
                 mem = get_available_gpu_memory(gpu_id)
                 print(f"GPU {gpu_id} available memory: {mem:.2f}GB")
-                if mem < 1:  # 如果可用显存小于1GB，发出警告
+                if mem < 1:
                     print(f"Warning: GPU {gpu_id} has very low available memory!")
             
             # 检查模型目录
@@ -958,7 +966,7 @@ def main(_):
                 raise FileNotFoundError(f"Model directory not found: {model_path}")
             print(f"Using model directory: {model_path}")
             
-            # 使用动态GPU ModelRunner
+            # 创建模型运行器
             print('Building model from scratch...')
             model_runner = DynamicGPUModelRunner(
                 config=make_model_config(
@@ -972,10 +980,6 @@ def main(_):
                 device=devices[0],
                 model_dir=pathlib.Path(MODEL_DIR.value),
             )
-            
-            print('Checking that model parameters can be loaded...')
-            _ = model_runner.model_params
-            print('Model parameters loaded successfully')
             
             # 处理输入
             num_fold_inputs = 0

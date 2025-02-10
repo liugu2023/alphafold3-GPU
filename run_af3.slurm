@@ -23,6 +23,9 @@ export JAX_FLASH_ATTENTION_IMPL=xla
 export XLA_PYTHON_CLIENT_MEM_FRACTION=0.95
 export JAX_TRACEBACK_FILTERING=off
 
+# 主程序只使用GPU 0
+export CUDA_VISIBLE_DEVICES=0
+
 # 运行AlphaFold
 python /archive/liugu/alphafold3-GPU/run_alphafold.py \
   --json_path=/archive/liugu/input/processed/1491aa_5KIS.json \
