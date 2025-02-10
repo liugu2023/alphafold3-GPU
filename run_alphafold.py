@@ -738,22 +738,19 @@ def get_gpu_utilization(gpu_id: int) -> float:
     except Exception:
         return 0
 
-def select_gpu_for_operation() -> int:
-    """根据GPU使用情况选择合适的GPU
-    
-    Returns:
-        int: 选择的GPU ID (0或1)
-    """
+def select_gpu_for_operation() -> jax.Device:
+    """根据GPU使用情况选择合适的GPU设备"""
     gpu0_util = get_gpu_utilization(_MAIN_GPU.value)
     gpu1_util = get_gpu_utilization(_WORKER_GPU.value)
     
     print(f"Current GPU utilization - GPU {_MAIN_GPU.value}: {gpu0_util:.1f}%, GPU {_WORKER_GPU.value}: {gpu1_util:.1f}%")
     
+    devices = jax.local_devices(backend='gpu')
     # 如果主GPU使用率超过80%，且备用GPU使用率较低，则使用备用GPU
     if gpu0_util > 80 and gpu1_util < gpu0_util:
         print(f"Switching to GPU {_WORKER_GPU.value} for next operation")
-        return _WORKER_GPU.value
-    return _MAIN_GPU.value
+        return devices[1]
+    return devices[0]
 
 class DynamicGPUModelRunner(ModelRunner):
     """支持动态GPU切换的ModelRunner"""
@@ -767,26 +764,38 @@ class DynamicGPUModelRunner(ModelRunner):
     def run_inference(self, featurised_example: features.BatchDict, rng_key: jnp.ndarray) -> model.ModelResult:
         """在适当的GPU上运行推理"""
         # 选择合适的GPU
-        selected_gpu = select_gpu_for_operation()
+        target_device = select_gpu_for_operation()
         
-        if selected_gpu == self._devices[1]:
-            print(f"Running inference on worker GPU")
-            # 在worker GPU上运行
-            with jax.default_device(self._devices[1]):
-                result = super().run_inference(featurised_example, rng_key)
-            # 确保数据返回到CPU内存
-            result = jax.tree.map(lambda x: np.array(x), result)
-            print(f"Inference completed on worker GPU, data transferred back to CPU")
-        else:
-            # 在主GPU上运行
-            with jax.default_device(self._devices[0]):
-                result = super().run_inference(featurised_example, rng_key)
+        # 将输入数据移动到目标设备
+        featurised_example = jax.device_put(featurised_example, target_device)
+        rng_key = jax.device_put(rng_key, target_device)
+        
+        print(f"Running inference on device: {target_device}")
+        
+        # 在选定的设备上运行推理
+        with jax.default_device(target_device):
+            # 创建一个新的模型实例在目标设备上
+            temp_model_runner = ModelRunner(
+                config=self._model_config,
+                device=target_device,
+                model_dir=self._model_dir
+            )
+            result = temp_model_runner.run_inference(featurised_example, rng_key)
+            
+            # 如果使用的是GPU 1，确保数据返回到CPU
+            if target_device == self._devices[1]:
+                result = jax.device_get(result)  # 移动到CPU
+                print(f"Data transferred back from {target_device} to CPU")
         
         return result
 
 def main(_):
     # 设置程序可以看到两个 GPU
     os.environ['CUDA_VISIBLE_DEVICES'] = f"{_MAIN_GPU.value},{_WORKER_GPU.value}"
+    
+    # 设置XLA默认不预分配全部显存
+    os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
+    os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '0.5'  # 每个GPU只预分配50%显存
     
     if _JAX_COMPILATION_CACHE_DIR.value is not None:
         jax.config.update(
@@ -911,6 +920,13 @@ def main(_):
             
             print(f'Found local devices: {devices}')
             print(f'Main GPU: {devices[0]}, Worker GPU: {devices[1]}')
+            
+            # 检查两个GPU是否都可用
+            for gpu_id in [_MAIN_GPU.value, _WORKER_GPU.value]:
+                mem = get_available_gpu_memory(gpu_id)
+                print(f"GPU {gpu_id} available memory: {mem:.2f}GB")
+                if mem < 1:  # 如果可用显存小于1GB，发出警告
+                    print(f"Warning: GPU {gpu_id} has very low available memory!")
             
             # 检查模型目录
             model_path = pathlib.Path(MODEL_DIR.value)
