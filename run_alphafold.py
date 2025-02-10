@@ -55,7 +55,6 @@ import numpy as np
 import psutil
 import GPUtil
 from concurrent.futures import ProcessPoolExecutor
-import tensorflow as tf
 import torch
 
 
