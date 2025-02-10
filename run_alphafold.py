@@ -786,17 +786,16 @@ def run_inference_process(
     
     # 重新初始化JAX
     try:
-        # 清理现有的JAX状态
-        jax.clear_backends()
+        # 清理缓存
         jax.clear_caches()
         
         # 强制重新初始化JAX的GPU后端
         devices = jax.devices('gpu')
-        print(f"JAX reinitialized successfully with devices: {devices}")
+        print(f"JAX initialized with devices: {devices}")
         
         # 验证GPU是否可用
         if not devices:
-            raise RuntimeError("No GPU devices found after JAX reinitialization")
+            raise RuntimeError("No GPU devices found after JAX initialization")
         
         # 检查显存状态
         memory_info = jax.device_memory_info(devices[0])
