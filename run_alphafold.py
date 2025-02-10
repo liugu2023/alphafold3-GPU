@@ -784,6 +784,17 @@ def run_inference_process(
     print(f"  XLA_PYTHON_CLIENT_MEM_FRACTION: {os.environ.get('XLA_PYTHON_CLIENT_MEM_FRACTION')}")
     print(f"  XLA_PYTHON_CLIENT_PREALLOCATE: {os.environ.get('XLA_PYTHON_CLIENT_PREALLOCATE')}")
     
+    # 检查GPU状态
+    try:
+        gpu_info = GPUtil.getGPUs()[gpu_id]
+        print(f"GPU {gpu_id} status:")
+        print(f"  Memory Free: {gpu_info.memoryFree}MB")
+        print(f"  Memory Used: {gpu_info.memoryUsed}MB")
+        print(f"  Memory Total: {gpu_info.memoryTotal}MB")
+        print(f"  GPU Load: {gpu_info.load*100:.1f}%")
+    except Exception as e:
+        print(f"Warning: Could not get GPU info: {str(e)}")
+    
     # 重新初始化JAX
     try:
         # 清理缓存
@@ -796,11 +807,6 @@ def run_inference_process(
         # 验证GPU是否可用
         if not devices:
             raise RuntimeError("No GPU devices found after JAX initialization")
-        
-        # 检查显存状态
-        memory_info = jax.device_memory_info(devices[0])
-        if memory_info:
-            print(f"Device memory info: {memory_info}")
             
     except Exception as e:
         print(f"Error during JAX initialization: {str(e)}")
@@ -827,9 +833,13 @@ def run_inference_process(
         print("Inference completed successfully")
     except Exception as e:
         print(f"Error during inference: {str(e)}")
-        print(f"Current JAX configuration:")
-        print(f"  Devices: {jax.devices()}")
-        print(f"  Memory info: {jax.device_memory_info(devices[0])}")
+        print(f"Current JAX devices: {jax.devices()}")
+        try:
+            gpu_info = GPUtil.getGPUs()[gpu_id]
+            print(f"GPU {gpu_id} status at error:")
+            print(f"  Memory Free: {gpu_info.memoryFree}MB")
+        except:
+            pass
         raise
     
     # 确保结果在CPU上
