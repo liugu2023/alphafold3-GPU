@@ -435,6 +435,9 @@ def predict_structure(
         for seed, example in zip(fold_input.rng_seeds, featurised_examples):
             print(f'Running inference for seed {seed}...')
             
+            # 为每个seed创建rng_key
+            rng_key = jax.random.PRNGKey(seed)
+            
             try:
                 result = pool.apply(
                     run_inference_process,
