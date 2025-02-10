@@ -414,7 +414,22 @@ def predict_structure_on_gpu(
     """在指定GPU上运行结构预测"""
     # 设置环境变量限制GPU使用
     os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
+    
+    # 设置JAX显存管理参数
+    os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'  # 禁止预分配
+    os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '0.9'   # 最多使用90%显存
+    os.environ['XLA_PYTHON_CLIENT_ALLOCATOR'] = 'platform'  # 使用平台原生分配器
+    os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'       # 允许显存动态增长
+    
+    # 清理显存
+    try:
+        jax.clear_caches()
+        jax.clear_backends()
+    except:
+        pass
+    
     print(f"Structure prediction process running on GPU {gpu_id}")
+    print(f"Available GPU memory before model creation: {get_available_gpu_memory(gpu_id):.2f}GB")
     
     # 初始化设备
     devices = jax.local_devices(backend='gpu')
@@ -422,58 +437,74 @@ def predict_structure_on_gpu(
         raise RuntimeError(f"No GPU devices found for prediction process")
     
     # 创建模型实例
-    model_runner = ModelRunner(
-        config=model_config,
-        device=devices[0],
-        model_dir=model_dir
-    )
+    try:
+        model_runner = ModelRunner(
+            config=model_config,
+            device=devices[0],
+            model_dir=model_dir
+        )
+        print(f"Model created successfully. Available GPU memory: {get_available_gpu_memory(gpu_id):.2f}GB")
+    except Exception as e:
+        print(f"Failed to create model: {str(e)}")
+        print(f"Available GPU memory at failure: {get_available_gpu_memory(gpu_id):.2f}GB")
+        raise
     
-    print(f'Featurising data with {len(fold_input.rng_seeds)} seed(s)...')
-    featurisation_start_time = time.time()
-    ccd = chemical_components.cached_ccd(user_ccd=fold_input.user_ccd)
-    featurised_examples = featurisation.featurise_input(
-        fold_input=fold_input,
-        buckets=buckets,
-        ccd=ccd,
-        verbose=True,
-        conformer_max_iterations=conformer_max_iterations,
-    )
-    print(
-        f'Featurising data with {len(fold_input.rng_seeds)} seed(s) took'
-        f' {time.time() - featurisation_start_time:.2f} seconds.'
-    )
-    
-    # 运行预测
+    # 分批处理以减少显存使用
+    batch_size = 1  # 每次只处理一个seed
     results = []
-    for seed, example in zip(fold_input.rng_seeds, featurised_examples):
-        print(f'Running inference for seed {seed}...')
-        rng_key = jax.random.PRNGKey(seed)
+    
+    for i in range(0, len(fold_input.rng_seeds), batch_size):
+        batch_seeds = fold_input.rng_seeds[i:i + batch_size]
+        print(f"Processing batch {i//batch_size + 1}/{len(fold_input.rng_seeds)//batch_size + 1}")
         
-        # 运行推理
-        result = model_runner.run_inference(example, rng_key)
+        # 特征化当前批次
+        print(f'Featurising data for seeds {batch_seeds}...')
+        featurisation_start_time = time.time()
+        ccd = chemical_components.cached_ccd(user_ccd=fold_input.user_ccd)
         
-        # 提取结构
-        print(f'Extracting output structure samples with seed {seed}...')
-        extract_structures = time.time()
-        inference_results = model_runner.extract_structures(
-            batch=example, result=result, target_name=fold_input.name
+        # 为当前批次创建新的fold_input
+        batch_fold_input = dataclasses.replace(fold_input, rng_seeds=batch_seeds)
+        featurised_examples = featurisation.featurise_input(
+            fold_input=batch_fold_input,
+            buckets=buckets,
+            ccd=ccd,
+            verbose=True,
+            conformer_max_iterations=conformer_max_iterations,
         )
-        print(
-            f'Extracting {len(inference_results)} output structure samples with'
-            f' seed {seed} took {time.time() - extract_structures:.2f} seconds.'
-        )
         
-        # 提取embeddings
-        embeddings = model_runner.extract_embeddings(result)
-        
-        results.append(
-            ResultsForSeed(
-                seed=seed,
-                inference_results=inference_results,
-                full_fold_input=fold_input,
-                embeddings=embeddings,
-            )
-        )
+        for seed, example in zip(batch_seeds, featurised_examples):
+            try:
+                print(f'Running inference for seed {seed}...')
+                print(f"Available GPU memory before inference: {get_available_gpu_memory(gpu_id):.2f}GB")
+                
+                rng_key = jax.random.PRNGKey(seed)
+                result = model_runner.run_inference(example, rng_key)
+                
+                print(f'Extracting output structure samples with seed {seed}...')
+                inference_results = model_runner.extract_structures(
+                    batch=example, result=result, target_name=fold_input.name
+                )
+                
+                embeddings = model_runner.extract_embeddings(result)
+                
+                results.append(
+                    ResultsForSeed(
+                        seed=seed,
+                        inference_results=inference_results,
+                        full_fold_input=fold_input,
+                        embeddings=embeddings,
+                    )
+                )
+                
+                # 清理当前迭代的显存
+                del result, inference_results, embeddings
+                jax.clear_caches()
+                print(f"Available GPU memory after processing seed {seed}: {get_available_gpu_memory(gpu_id):.2f}GB")
+                
+            except Exception as e:
+                print(f"Error processing seed {seed}: {str(e)}")
+                print(f"Available GPU memory at error: {get_available_gpu_memory(gpu_id):.2f}GB")
+                raise
     
     return results
 
