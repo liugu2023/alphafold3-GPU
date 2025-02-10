@@ -32,4 +32,4 @@ python /archive/liugu/alphafold3-GPU/run_alphafold.py \
   --output_dir=/archive/liugu/output-GPU \
   --model_dir=/archive/liugu/model \
   --norun_data_pipeline \
-  --num_recycles=3 \
+  --num_recycles=3 
