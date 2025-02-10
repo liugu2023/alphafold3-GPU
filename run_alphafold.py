@@ -457,7 +457,7 @@ def predict_structure(
     
     # 强制 Python 垃圾回收
     gc.collect()
-    gc.collect()  # 运行两次以处理循环引用
+    gc.collect()
     
     # 删除可能的大对象
     del ccd
@@ -469,70 +469,23 @@ def predict_structure(
     
     print("Memory cleanup completed")
     
-    # 4. 在GPU0上初始化JAX
-    print("\n=== Initializing JAX on GPU 0 ===")
-    print(f"Current CUDA_VISIBLE_DEVICES before JAX init: {os.environ.get('CUDA_VISIBLE_DEVICES', 'Not set')}")
-    
-    os.environ['CUDA_VISIBLE_DEVICES'] = str(main_gpu)
-    os.environ.update({
-        'XLA_PYTHON_CLIENT_MEM_FRACTION': '0.95',
-        'XLA_PYTHON_CLIENT_PREALLOCATE': 'true',
-        'XLA_PYTHON_CLIENT_ALLOCATOR': 'platform',
-        'XLA_FORCE_HOST_PLATFORM_DEVICE_COUNT': '1',
-        'TF_FORCE_GPU_ALLOW_GROWTH': 'false',
-        'XLA_PYTHON_CLIENT_MEM_LIMIT_MB': '14000',
-    })
-    
-    # 重新初始化JAX并输出设备信息
-    jax.clear_caches()
-    import importlib
-    importlib.reload(jax.lib)
-    importlib.reload(jax)
-    
-    print("\n=== JAX Device Information ===")
-    print(f"JAX backend: {jax.default_backend()}")
-    print(f"All visible devices to JAX: {jax.devices()}")
-    print(f"Default device: {jax.default_device()}")
-    print(f"Current CUDA_VISIBLE_DEVICES after JAX init: {os.environ.get('CUDA_VISIBLE_DEVICES', 'Not set')}")
-    
-    try:
-        gpu_devices = jax.devices('gpu')
-        print(f"Available GPU devices to JAX: {gpu_devices}")
-        for device in gpu_devices:
-            print(f"  - Device: {device}")
-            print(f"    Platform: {device.platform}")
-            print(f"    Device kind: {device.device_kind}")
-            print(f"    Device ID: {device.id}")
-    except Exception as e:
-        print(f"Error getting GPU device information: {e}")
-    
-    # 5. 重新检查显存状态
+    # 4. 检查清理后的显存状态
     gpu0_used, gpu0_total = get_gpu_memory_info(main_gpu)
     gpu1_used, gpu1_total = get_gpu_memory_info(worker_gpu)
     gpu0_free = gpu0_total - gpu0_used
     gpu1_free = gpu1_total - gpu1_used
     
-    print("\n=== GPU Memory Status After JAX Init ===")
+    print("\n=== GPU Memory Status After Cleanup ===")
     print(f"GPU {main_gpu}: Used={gpu0_used:.1f}GB/Total={gpu0_total:.1f}GB (Free: {gpu0_free:.1f}GB)")
     print(f"GPU {worker_gpu}: Used={gpu1_used:.1f}GB/Total={gpu1_total:.1f}GB (Free: {gpu1_free:.1f}GB)")
     
-    # 6. 选择显存较多的GPU进行推理
+    # 5. 选择显存较多的GPU进行推理
     MIN_REQUIRED_MEMORY = 8.0
     selected_gpu = worker_gpu if gpu1_free >= MIN_REQUIRED_MEMORY else main_gpu
     print(f"\n=== GPU Selection Result ===")
     print(f"Selected GPU {selected_gpu} for inference")
-    try:
-        gpu_devices = jax.devices('gpu')
-        print(f"Available GPU devices to JAX: {gpu_devices}")
-        for device in gpu_devices:
-            print(f"  - Device: {device}")
-            print(f"    Platform: {device.platform}")
-            print(f"    Device kind: {device.device_kind}")
-            print(f"    Device ID: {device.id}")
-    except Exception as e:
-        print(f"Error getting GPU device information: {e}")
     
-    # 创建进程池用于推理
+    # 6. 创建进程池用于推理
     ctx = multiprocessing.get_context('spawn')
     with ctx.Pool(1, maxtasksperchild=1) as pool:
         for seed, example in zip(fold_input.rng_seeds, featurised_examples):
@@ -569,6 +522,7 @@ def predict_structure(
             # 清理内存
             del result, inference_results, embeddings
             jax.clear_caches()
+            gc.collect()
     
     return results
 
