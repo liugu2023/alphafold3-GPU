@@ -441,11 +441,33 @@ def predict_structure(
         f'Featurising data took {time.time() - featurisation_start_time:.2f} seconds.'
     )
     
-    # 3. 清理特征化过程占用的显存
+    # 3. 彻底清理特征化过程占用的显存
     print("\n=== Cleaning up GPU memory after featurisation ===")
-    torch.cuda.empty_cache()  # 清理PyTorch缓存
-    jax.clear_caches()        # 清理JAX缓存
-    gc.collect()              # 强制垃圾回收
+    
+    # 清理 PyTorch 缓存和显存
+    torch.cuda.empty_cache()
+    if torch.cuda.is_available():
+        for i in range(torch.cuda.device_count()):
+            with torch.cuda.device(i):
+                torch.cuda.empty_cache()
+                torch.cuda.ipc_collect()
+    
+    # 清理 JAX 缓存
+    jax.clear_caches()
+    
+    # 强制 Python 垃圾回收
+    gc.collect()
+    gc.collect()  # 运行两次以处理循环引用
+    
+    # 删除可能的大对象
+    del ccd
+    gc.collect()
+    
+    # 等待 GPU 操作完成
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    
+    print("Memory cleanup completed")
     
     # 4. 在GPU0上初始化JAX
     print("\n=== Initializing JAX on GPU 0 ===")
