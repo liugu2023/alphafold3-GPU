@@ -429,23 +429,27 @@ def predict_structure(
     
     # 创建进程池用于推理
     ctx = multiprocessing.get_context('spawn')
-    with ctx.Pool(1) as pool:
+    with ctx.Pool(1, maxtasksperchild=1) as pool:  # 每个任务后重新创建进程
         for seed, example in zip(fold_input.rng_seeds, featurised_examples):
             print(f'Running inference for seed {seed}...')
             
             # 只在GPU 1上运行推理
             rng_key = jax.random.PRNGKey(seed)
-            result = pool.apply(
-                run_inference_process,
-                args=(
-                    example,
-                    rng_key,
-                    model_runner._model_config,
-                    model_runner._model_dir,
-                    _WORKER_GPU.value,
-                    True,  # 标记这是worker GPU
+            try:
+                result = pool.apply(
+                    run_inference_process,
+                    args=(
+                        example,
+                        rng_key,
+                        model_runner._model_config,
+                        model_runner._model_dir,
+                        _WORKER_GPU.value,
+                        True,
+                    )
                 )
-            )
+            except Exception as e:
+                print(f"Error in inference process: {str(e)}")
+                raise
             
             # 在主进程（GPU 0）上提取结构和embeddings
             print(f'Extracting output structure samples with seed {seed}...')
@@ -759,13 +763,17 @@ def run_inference_process(
     model_config: model.Model.Config,
     model_dir: pathlib.Path,
     gpu_id: int,
-    is_worker_gpu: bool = False,  # 添加标志来区分是否是worker GPU
+    is_worker_gpu: bool = False,
 ) -> model.ModelResult:
     """在独立进程中运行推理"""
     # 设置环境变量限制GPU使用
     os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
     
-    # 根据是否是worker GPU设置不同的显存管理策略
+    # 设置CUDA和cuBLAS相关环境变量
+    os.environ['XLA_FLAGS'] = '--xla_gpu_cuda_data_dir=/usr/local/cuda'
+    os.environ['LD_LIBRARY_PATH'] = '/usr/local/cuda/lib64'
+    
+    # 设置显存管理策略
     if is_worker_gpu:
         os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
         os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '0.95'
@@ -774,23 +782,54 @@ def run_inference_process(
     
     print(f"Inference process starting on GPU {gpu_id}")
     
+    # 重新初始化JAX
+    try:
+        jax.clear_backends()
+        # 强制重新初始化JAX的GPU后端
+        _ = jax.devices('gpu')
+    except Exception as e:
+        print(f"Warning: Failed to reinitialize JAX: {str(e)}")
+    
+    # 等待GPU就绪
+    time.sleep(2)
+    
     # 初始化设备
-    devices = jax.local_devices(backend='gpu')
-    if not devices:
-        raise RuntimeError(f"No GPU devices found for inference process")
+    try:
+        devices = jax.local_devices(backend='gpu')
+        if not devices:
+            raise RuntimeError(f"No GPU devices found for inference process")
+        print(f"Successfully initialized devices: {devices}")
+    except Exception as e:
+        print(f"Error initializing devices: {str(e)}")
+        raise
     
     # 创建模型实例
-    inference_model = ModelRunner(
-        config=model_config,
-        device=devices[0],  # 由于设置了CUDA_VISIBLE_DEVICES，这里一定是目标GPU
-        model_dir=model_dir
-    )
+    try:
+        inference_model = ModelRunner(
+            config=model_config,
+            device=devices[0],
+            model_dir=model_dir
+        )
+        print("Successfully created model runner")
+    except Exception as e:
+        print(f"Error creating model runner: {str(e)}")
+        raise
     
     # 运行推理
-    result = inference_model.run_inference(featurised_example, rng_key)
+    try:
+        print("Starting inference...")
+        result = inference_model.run_inference(featurised_example, rng_key)
+        print("Inference completed successfully")
+    except Exception as e:
+        print(f"Error during inference: {str(e)}")
+        raise
     
     # 确保结果在CPU上
-    result = jax.tree_util.tree_map(lambda x: np.array(x) if isinstance(x, (np.ndarray, jnp.ndarray)) else x, result)
+    result = jax.tree_util.tree_map(
+        lambda x: np.array(x) if isinstance(x, (np.ndarray, jnp.ndarray)) else x,
+        result
+    )
+    
     return result
 
 class DynamicGPUModelRunner(ModelRunner):
