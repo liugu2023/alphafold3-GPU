@@ -430,11 +430,7 @@ def predict_structure(
         f'Featurising data took {time.time() - featurisation_start_time:.2f} seconds.'
     )
     
-    # 在创建子进程前设置环境变量
-    original_cuda_visible_devices = os.environ.get('CUDA_VISIBLE_DEVICES')
-    os.environ['CUDA_VISIBLE_DEVICES'] = str(worker_gpu)
-    
-    # 创建进程池用于推理
+    # 创建进程池用于推理，但不预先设置 GPU
     ctx = multiprocessing.get_context('spawn')
     with ctx.Pool(1, maxtasksperchild=1) as pool:
         for seed, example in zip(fold_input.rng_seeds, featurised_examples):
@@ -443,23 +439,19 @@ def predict_structure(
             # 为每个seed创建rng_key
             rng_key = jax.random.PRNGKey(seed)
             
-            try:
-                result = pool.apply(
-                    run_inference_process,
-                    args=(
-                        example,
-                        rng_key,
-                        model_runner._model_config,
-                        model_runner._model_dir,
-                        main_gpu,
-                        worker_gpu,
-                        True,
-                    )
+            # 在子进程中再决定使用哪个 GPU
+            result = pool.apply(
+                run_inference_process,
+                args=(
+                    example,
+                    rng_key,
+                    model_runner._model_config,
+                    model_runner._model_dir,
+                    main_gpu,
+                    worker_gpu,
+                    True,
                 )
-                print(f"Inference completed successfully for seed {seed}")
-            except Exception as e:
-                print(f"Error in inference process for seed {seed}: {str(e)}")
-                raise
+            )
             
             # 在主进程（GPU 0）上提取结构和embeddings
             print(f'Extracting output structure samples with seed {seed}...')
@@ -480,10 +472,6 @@ def predict_structure(
             # 清理内存
             del result, inference_results, embeddings
             jax.clear_caches()
-    
-    # 恢复原始环境变量
-    if original_cuda_visible_devices is not None:
-        os.environ['CUDA_VISIBLE_DEVICES'] = original_cuda_visible_devices
     
     return results
 
