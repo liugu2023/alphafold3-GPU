@@ -765,11 +765,6 @@ class DynamicGPUModelRunner(ModelRunner):
         """在适当的GPU上运行推理"""
         # 选择合适的GPU
         target_device = select_gpu_for_operation()
-        
-        # 将输入数据移动到目标设备
-        featurised_example = jax.device_put(featurised_example, target_device)
-        rng_key = jax.device_put(rng_key, target_device)
-        
         print(f"Running inference on device: {target_device}")
         
         # 在选定的设备上运行推理
@@ -780,11 +775,36 @@ class DynamicGPUModelRunner(ModelRunner):
                 device=target_device,
                 model_dir=self._model_dir
             )
+            
+            # 只移动数值类型的数据到GPU
+            def move_to_device(x):
+                try:
+                    if isinstance(x, (np.ndarray, jnp.ndarray)) and np.issubdtype(x.dtype, np.number):
+                        return jax.device_put(x, target_device)
+                    return x
+                except Exception as e:
+                    print(f"Warning: Failed to move data to device: {str(e)}")
+                    return x
+            
+            # 递归处理输入数据
+            featurised_example = jax.tree_util.tree_map(move_to_device, featurised_example)
+            rng_key = jax.device_put(rng_key, target_device)
+            
+            # 运行推理
             result = temp_model_runner.run_inference(featurised_example, rng_key)
             
             # 如果使用的是GPU 1，确保数据返回到CPU
             if target_device == self._devices[1]:
-                result = jax.device_get(result)  # 移动到CPU
+                def move_to_cpu(x):
+                    try:
+                        if isinstance(x, (np.ndarray, jnp.ndarray)):
+                            return np.array(x)
+                        return x
+                    except Exception as e:
+                        print(f"Warning: Failed to move data to CPU: {str(e)}")
+                        return x
+                
+                result = jax.tree_util.tree_map(move_to_cpu, result)
                 print(f"Data transferred back from {target_device} to CPU")
         
         return result
