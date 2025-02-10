@@ -914,9 +914,6 @@ def main(_):
     time.sleep(2)
     
     try:
-        # 在程序开始时就在GPU 1上预留显存
-        reserve_gpu_memory(_WORKER_GPU.value, memory_fraction=0.3)  # 预留30%显存（约5GB在16GB显卡上）
-        
         # 主进程使用 GPU 0，允许预分配显存以提高性能
         os.environ['CUDA_VISIBLE_DEVICES'] = str(_MAIN_GPU.value)
         # GPU 0 的显存管理：允许预分配，但限制使用量
@@ -1060,7 +1057,7 @@ def main(_):
                 
                 # 创建模型运行器
                 print('Building model from scratch...')
-                model_runner = DynamicGPUModelRunner(
+                model_runner = ModelRunner(
                     config=make_model_config(
                         flash_attention_implementation=typing.cast(
                             attention.Implementation, _FLASH_ATTENTION_IMPLEMENTATION.value
