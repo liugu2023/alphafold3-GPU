@@ -861,9 +861,8 @@ def run_inference_process(
         target_gpu = main_gpu if gpu0_free > gpu1_free else worker_gpu
         print(f"Selected GPU {target_gpu} with {max(gpu0_free, gpu1_free):.1f}GB free memory")
         
-        # 4. 清理之前的JAX状态
+        # 4. 清理JAX缓存
         jax.clear_caches()
-        jax.clear_backend_state()
         
         # 5. 设置环境变量 - 在JAX初始化前设置
         os.environ['CUDA_VISIBLE_DEVICES'] = str(target_gpu)
