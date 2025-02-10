@@ -412,11 +412,37 @@ def predict_structure(
     buckets: Sequence[int] | None = None,
     conformer_max_iterations: int | None = None,
 ) -> Sequence[ResultsForSeed]:
-    """在主进程中处理特征化，在GPU 1上只运行推理"""
+    """在主进程中处理特征化，在GPU上运行推理"""
     results = []
     
-    # 在主进程（GPU 0）上进行特征化
-    print(f'Featurising data with {len(fold_input.rng_seeds)} seed(s)...')
+    # 1. 在开始前检查GPU显存状态
+    gpu0_used, gpu0_total = get_gpu_memory_info(main_gpu)
+    gpu1_used, gpu1_total = get_gpu_memory_info(worker_gpu)
+    gpu0_free = gpu0_total - gpu0_used
+    gpu1_free = gpu1_total - gpu1_used
+    
+    print("\n=== Initial GPU Memory Status ===")
+    print(f"GPU {main_gpu}: Used={gpu0_used:.1f}GB/Total={gpu0_total:.1f}GB (Free: {gpu0_free:.1f}GB)")
+    print(f"GPU {worker_gpu}: Used={gpu1_used:.1f}GB/Total={gpu1_total:.1f}GB (Free: {gpu1_free:.1f}GB)")
+    
+    # 2. 检查是否有足够显存
+    MIN_REQUIRED_MEMORY = 8.0
+    if max(gpu0_free, gpu1_free) < MIN_REQUIRED_MEMORY:
+        raise RuntimeError(
+            f"No GPU has enough free memory before starting (need at least {MIN_REQUIRED_MEMORY}GB). "
+            f"GPU {main_gpu}: {gpu0_free:.1f}GB free, GPU {worker_gpu}: {gpu1_free:.1f}GB free"
+        )
+    
+    # 3. 选择显存较多的GPU
+    selected_gpu = main_gpu if gpu0_free > gpu1_free else worker_gpu
+    print(f"\n=== GPU Selection Result ===")
+    print(f"Selected GPU {selected_gpu} with {max(gpu0_free, gpu1_free):.1f}GB free memory")
+    
+    # 4. 设置环境变量 - 只让JAX看到选中的GPU
+    os.environ['CUDA_VISIBLE_DEVICES'] = str(selected_gpu)
+    
+    # 在主进程上进行特征化
+    print(f'\nFeaturising data with {len(fold_input.rng_seeds)} seed(s)...')
     featurisation_start_time = time.time()
     ccd = chemical_components.cached_ccd(user_ccd=fold_input.user_ccd)
     featurised_examples = featurisation.featurise_input(
@@ -430,7 +456,7 @@ def predict_structure(
         f'Featurising data took {time.time() - featurisation_start_time:.2f} seconds.'
     )
     
-    # 创建进程池用于推理，但不预先设置 GPU
+    # 创建进程池用于推理
     ctx = multiprocessing.get_context('spawn')
     with ctx.Pool(1, maxtasksperchild=1) as pool:
         for seed, example in zip(fold_input.rng_seeds, featurised_examples):
@@ -439,7 +465,7 @@ def predict_structure(
             # 为每个seed创建rng_key
             rng_key = jax.random.PRNGKey(seed)
             
-            # 在子进程中再决定使用哪个 GPU
+            # 在子进程中运行推理
             result = pool.apply(
                 run_inference_process,
                 args=(
@@ -447,14 +473,11 @@ def predict_structure(
                     rng_key,
                     model_runner._model_config,
                     model_runner._model_dir,
-                    main_gpu,
-                    worker_gpu,
-                    True,
+                    selected_gpu,  # 直接使用选定的GPU
                 )
             )
             
-            # 在主进程（GPU 0）上提取结构和embeddings
-            print(f'Extracting output structure samples with seed {seed}...')
+            # 处理结果...
             inference_results = model_runner.extract_structures(
                 batch=example, result=result, target_name=fold_input.name
             )
@@ -833,40 +856,12 @@ def run_inference_process(
     rng_key: jnp.ndarray,
     model_config: model.Model.Config,
     model_dir: pathlib.Path,
-    main_gpu: int,
-    worker_gpu: int,
-    is_worker_gpu: bool = False,
+    gpu_id: int,  # 只需要一个GPU ID
 ) -> model.ModelResult:
-    """在显存占用较低的GPU上运行推理"""
+    """在指定GPU上运行推理"""
     try:
-        # 1. 在JAX初始化前检查显存状态
-        gpu0_used, gpu0_total = get_gpu_memory_info(main_gpu)
-        gpu1_used, gpu1_total = get_gpu_memory_info(worker_gpu)
-        gpu0_free = gpu0_total - gpu0_used
-        gpu1_free = gpu1_total - gpu1_used
-        
-        print("\n=== GPU Memory Status Before Selection ===")
-        print(f"GPU {main_gpu}: Used={gpu0_used:.1f}GB/Total={gpu0_total:.1f}GB (Free: {gpu0_free:.1f}GB)")
-        print(f"GPU {worker_gpu}: Used={gpu1_used:.1f}GB/Total={gpu1_total:.1f}GB (Free: {gpu1_free:.1f}GB)")
-        
-        # 2. 检查是否有足够显存并选择GPU
-        MIN_REQUIRED_MEMORY = 8.0
-        if max(gpu0_free, gpu1_free) < MIN_REQUIRED_MEMORY:
-            raise RuntimeError(
-                f"No GPU has enough free memory before JAX initialization (need at least {MIN_REQUIRED_MEMORY}GB). "
-                f"GPU {main_gpu}: {gpu0_free:.1f}GB free, GPU {worker_gpu}: {gpu1_free:.1f}GB free"
-            )
-        
-        # 3. 选择显存较多的GPU
-        selected_gpu = main_gpu if gpu0_free > gpu1_free else worker_gpu
-        print(f"\n=== GPU Selection Result ===")
-        print(f"Selected GPU {selected_gpu} with {max(gpu0_free, gpu1_free):.1f}GB free memory")
-        
-        # 4. 清理JAX缓存
-        jax.clear_caches()
-        
-        # 5. 设置环境变量 - 只让JAX看到选中的GPU
-        os.environ['CUDA_VISIBLE_DEVICES'] = str(selected_gpu)
+        # 1. 设置环境变量
+        os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
         os.environ.update({
             'XLA_PYTHON_CLIENT_MEM_FRACTION': '0.95',
             'XLA_PYTHON_CLIENT_PREALLOCATE': 'true',
@@ -876,41 +871,27 @@ def run_inference_process(
             'XLA_PYTHON_CLIENT_MEM_LIMIT_MB': '14000',
         })
         
-        # 6. 重新初始化JAX
+        # 2. 清理JAX缓存并重新初始化
+        jax.clear_caches()
         import importlib
         importlib.reload(jax.lib)
         importlib.reload(jax)
         
-        # 7. 验证JAX设备
+        # 3. 验证JAX设备
         devices = jax.devices('gpu')
         if not devices:
             raise RuntimeError("No GPU devices found")
-        print(f"\n=== JAX Initialization Status ===")
-        print(f"JAX initialized with devices: {devices}")
-        print(f"Current CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES')}")
-        print(f"Current JAX backend: {jax.default_backend()}")
-        
-        # 再次检查选定GPU的显存状态
-        used, total = get_gpu_memory_info(selected_gpu)
-        free = total - used
-        print(f"\n=== Selected GPU Status After JAX Init ===")
-        print(f"GPU {selected_gpu}: Used={used:.1f}GB/Total={total:.1f}GB (Free: {free:.1f}GB)")
-        
-        # 8. 创建模型实例
-        with jax.default_device(devices[0]):  # 只有一个设备，所以用devices[0]
+            
+        # 4. 创建模型实例并运行推理
+        with jax.default_device(devices[0]):
             inference_model = ModelRunner(
                 config=model_config,
                 device=devices[0],
                 model_dir=model_dir
             )
-            print("Successfully created model runner")
-            
-            # 9. 运行推理
-            print("Starting inference...")
             result = inference_model.run_inference(featurised_example, rng_key)
-            print("Inference completed successfully")
-        
-        # 10. 确保结果在CPU上
+            
+        # 5. 确保结果在CPU上
         result = jax.tree_util.tree_map(
             lambda x: np.array(x) if isinstance(x, (np.ndarray, jnp.ndarray)) else x,
             result
@@ -920,11 +901,6 @@ def run_inference_process(
         
     except Exception as e:
         print(f"Error in inference process: {str(e)}")
-        print(f"Current CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES')}")
-        print(f"JAX devices: {jax.devices()}")
-        print(f"Current JAX backend: {jax.default_backend()}")
-        used, total = get_gpu_memory_info(selected_gpu)
-        print(f"GPU {selected_gpu} memory at error: {used:.1f}GB/{total:.1f}GB")
         raise
 
 def main(_):
