@@ -839,31 +839,18 @@ def run_inference_process(
 ) -> model.ModelResult:
     """在显存占用较低的GPU上运行推理"""
     try:
-        # 1. 在JAX初始化前检查显存并选择GPU
-        gpu0_used, gpu0_total = get_gpu_memory_info(main_gpu)
-        gpu1_used, gpu1_total = get_gpu_memory_info(worker_gpu)
-        gpu0_free = gpu0_total - gpu0_used
-        gpu1_free = gpu1_total - gpu1_used
-        
-        print(f"Initial GPU memory status:")
-        print(f"GPU {main_gpu}: {gpu0_used:.1f}GB/{gpu0_total:.1f}GB (Free: {gpu0_free:.1f}GB)")
-        print(f"GPU {worker_gpu}: {gpu1_used:.1f}GB/{gpu1_total:.1f}GB (Free: {gpu1_free:.1f}GB)")
-        
-        # 2. 选择显存较多的GPU
-        if gpu0_free >= 8.0 and gpu0_free > gpu1_free:
-            target_gpu = main_gpu
-        elif gpu1_free >= 8.0:
-            target_gpu = worker_gpu
-        else:
-            raise RuntimeError(
-                f"No GPU has enough free memory (need at least 8GB). "
-                f"GPU {main_gpu}: {gpu0_free:.1f}GB free, GPU {worker_gpu}: {gpu1_free:.1f}GB free"
-            )
-        
+        # 1. 选择显存占用较低的GPU
+        target_gpu = select_gpu_for_inference(main_gpu, worker_gpu)
         print(f"Selected GPU {target_gpu} for inference")
         
-        # 3. 设置环境变量 - 在JAX初始化前
+        # 2. 设置环境变量
         os.environ['CUDA_VISIBLE_DEVICES'] = str(target_gpu)
+        
+        # 3. 检查初始显存状态
+        used_before, total = get_gpu_memory_info(target_gpu)
+        print(f"GPU {target_gpu} initial memory: {used_before:.1f}GB/{total:.1f}GB")
+        
+        # 4. 设置JAX配置 - 修改显存管理策略
         os.environ.update({
             'XLA_PYTHON_CLIENT_MEM_FRACTION': '0.95',
             'XLA_PYTHON_CLIENT_PREALLOCATE': 'true',
@@ -873,17 +860,19 @@ def run_inference_process(
             'XLA_PYTHON_CLIENT_MEM_LIMIT_MB': '14000',
         })
         
-        # 4. 重新导入JAX以确保使用新的环境变量
-        import importlib
-        import jax
-        importlib.reload(jax)
+        # 5. 预分配显存并检查
+        dummy_tensor = jnp.ones((1024, 1024, 64), dtype=jnp.float32)
+        dummy_tensor.block_until_ready()
+        used_after_prealloc, _ = get_gpu_memory_info(target_gpu)
+        prealloc_size = used_after_prealloc - used_before
+        print(f"JAX preallocated {prealloc_size:.1f}GB of GPU memory")
         
-        # 5. 初始化JAX设备
+        # 6. 创建模型实例
         devices = jax.devices('gpu')
         if not devices:
             raise RuntimeError("No GPU devices found")
-        
-        # 6. 创建模型并运行推理
+            
+        # 7. 使用默认设备上下文
         with jax.default_device(devices[0]):
             inference_model = ModelRunner(
                 config=model_config,
@@ -892,11 +881,22 @@ def run_inference_process(
             )
             print("Successfully created model runner")
             
+            # 8. 检查模型加载后的显存
+            used_after_model, _ = get_gpu_memory_info(target_gpu)
+            model_size = used_after_model - used_after_prealloc
+            print(f"Model loading used additional {model_size:.1f}GB of GPU memory")
+            
+            # 9. 运行推理
             print("Starting inference...")
             result = inference_model.run_inference(featurised_example, rng_key)
             print("Inference completed successfully")
+            
+            # 10. 检查推理后的显存
+            used_after_inference, _ = get_gpu_memory_info(target_gpu)
+            inference_size = used_after_inference - used_after_model
+            print(f"Inference used additional {inference_size:.1f}GB of GPU memory")
         
-        # 7. 确保结果在CPU上
+        # 11. 确保结果在CPU上
         result = jax.tree_util.tree_map(
             lambda x: np.array(x) if isinstance(x, (np.ndarray, jnp.ndarray)) else x,
             result
@@ -906,9 +906,8 @@ def run_inference_process(
         
     except Exception as e:
         print(f"Error in inference process: {str(e)}")
-        current_gpu = int(os.environ.get('CUDA_VISIBLE_DEVICES', '0'))
-        used, total = get_gpu_memory_info(current_gpu)
-        print(f"GPU {current_gpu} memory at error: {used:.1f}GB/{total:.1f}GB")
+        used, total = get_gpu_memory_info(target_gpu)
+        print(f"GPU {target_gpu} memory at error: {used:.1f}GB/{total:.1f}GB")
         print(f"JAX devices: {jax.devices()}")
         print(f"Current JAX backend: {jax.default_backend()}")
         raise
