@@ -56,6 +56,7 @@ import psutil
 import GPUtil
 from concurrent.futures import ProcessPoolExecutor
 import tensorflow as tf
+import torch
 
 
 _HOME_DIR = pathlib.Path(os.environ.get('HOME'))
@@ -858,17 +859,23 @@ def reserve_gpu_memory(gpu_id: int, memory_fraction: float = 0.3):
     os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
     
     try:
-        # 创建TensorFlow配置
-        gpus = tf.config.list_physical_devices('GPU')
-        if gpus:
-            # 限制TensorFlow只使用一部分显存
-            tf.config.set_logical_device_configuration(
-                gpus[0],
-                [tf.config.LogicalDeviceConfiguration(memory_limit=int(16384 * memory_fraction))]  # 假设是16GB显卡
-            )
-            # 分配一个持续存在的张量来预留显存
-            placeholder = tf.random.normal([int(8192 * memory_fraction), 1024])  # 创建大张量
-            print(f"Successfully reserved {memory_fraction*100:.1f}% memory on GPU {gpu_id}")
+        # 确保PyTorch使用指定的GPU
+        torch.cuda.set_device(0)  # 因为设置了CUDA_VISIBLE_DEVICES，所以这里用0
+        
+        # 获取GPU总显存
+        total_memory = torch.cuda.get_device_properties(0).total_memory
+        target_memory = int(total_memory * memory_fraction)
+        
+        # 创建一个大张量来预留显存
+        # 使用固定内存以确保不会被释放
+        placeholder = torch.empty(target_memory, dtype=torch.int8, device='cuda')
+        torch.cuda.empty_cache()  # 清理可能的碎片
+        
+        print(f"Successfully reserved {memory_fraction*100:.1f}% memory ({target_memory/1024/1024/1024:.1f}GB) on GPU {gpu_id}")
+        
+        # 保持张量存活
+        placeholder.record_stream(torch.cuda.current_stream())
+        
     except Exception as e:
         print(f"Failed to reserve memory on GPU {gpu_id}: {e}")
     finally:
@@ -880,7 +887,7 @@ def reserve_gpu_memory(gpu_id: int, memory_fraction: float = 0.3):
 
 def main(_):
     # 在程序开始时就在GPU 1上预留显存
-    reserve_gpu_memory(_WORKER_GPU.value)
+    reserve_gpu_memory(_WORKER_GPU.value, memory_fraction=0.3)  # 预留30%显存（约5GB在16GB显卡上）
     
     # 主进程使用 GPU 0，允许预分配显存以提高性能
     os.environ['CUDA_VISIBLE_DEVICES'] = str(_MAIN_GPU.value)
