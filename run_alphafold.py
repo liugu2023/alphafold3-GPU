@@ -766,41 +766,45 @@ def run_inference_process(
     is_worker_gpu: bool = False,
 ) -> model.ModelResult:
     """在独立进程中运行推理"""
-    # 设置环境变量限制GPU使用
-    os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
-    
-    # 设置CUDA和cuBLAS相关环境变量
-    os.environ['XLA_FLAGS'] = '--xla_gpu_cuda_data_dir=/usr/local/cuda'
-    os.environ['LD_LIBRARY_PATH'] = '/usr/local/cuda/lib64'
-    
-    # 设置显存管理策略
-    if is_worker_gpu:
-        os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
-        os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '0.95'
-        os.environ['XLA_PYTHON_CLIENT_ALLOCATOR'] = 'platform'
-        os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'
+    # 设置基本环境变量
+    os.environ.update({
+        'CUDA_VISIBLE_DEVICES': str(gpu_id),
+        # JAX配置
+        'XLA_PYTHON_CLIENT_MEM_FRACTION': '0.95',
+        'XLA_PYTHON_CLIENT_PREALLOCATE': 'false',
+        'XLA_PYTHON_CLIENT_ALLOCATOR': 'platform',
+        'TF_FORCE_GPU_ALLOW_GROWTH': 'true',
+        # JAX CUDA配置
+        'XLA_FLAGS': '--xla_gpu_force_compilation_parallelism=1'
+    })
     
     print(f"Inference process starting on GPU {gpu_id}")
+    print("JAX configuration:")
+    print(f"  CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES')}")
+    print(f"  XLA_PYTHON_CLIENT_MEM_FRACTION: {os.environ.get('XLA_PYTHON_CLIENT_MEM_FRACTION')}")
+    print(f"  XLA_PYTHON_CLIENT_PREALLOCATE: {os.environ.get('XLA_PYTHON_CLIENT_PREALLOCATE')}")
     
     # 重新初始化JAX
     try:
+        # 清理现有的JAX状态
         jax.clear_backends()
+        jax.clear_caches()
+        
         # 强制重新初始化JAX的GPU后端
-        _ = jax.devices('gpu')
-    except Exception as e:
-        print(f"Warning: Failed to reinitialize JAX: {str(e)}")
-    
-    # 等待GPU就绪
-    time.sleep(2)
-    
-    # 初始化设备
-    try:
-        devices = jax.local_devices(backend='gpu')
+        devices = jax.devices('gpu')
+        print(f"JAX reinitialized successfully with devices: {devices}")
+        
+        # 验证GPU是否可用
         if not devices:
-            raise RuntimeError(f"No GPU devices found for inference process")
-        print(f"Successfully initialized devices: {devices}")
+            raise RuntimeError("No GPU devices found after JAX reinitialization")
+        
+        # 检查显存状态
+        memory_info = jax.device_memory_info(devices[0])
+        if memory_info:
+            print(f"Device memory info: {memory_info}")
+            
     except Exception as e:
-        print(f"Error initializing devices: {str(e)}")
+        print(f"Error during JAX initialization: {str(e)}")
         raise
     
     # 创建模型实例
@@ -813,15 +817,20 @@ def run_inference_process(
         print("Successfully created model runner")
     except Exception as e:
         print(f"Error creating model runner: {str(e)}")
+        print(f"Current JAX devices: {jax.devices()}")
         raise
     
     # 运行推理
     try:
         print("Starting inference...")
-        result = inference_model.run_inference(featurised_example, rng_key)
+        with jax.default_device(devices[0]):
+            result = inference_model.run_inference(featurised_example, rng_key)
         print("Inference completed successfully")
     except Exception as e:
         print(f"Error during inference: {str(e)}")
+        print(f"Current JAX configuration:")
+        print(f"  Devices: {jax.devices()}")
+        print(f"  Memory info: {jax.device_memory_info(devices[0])}")
         raise
     
     # 确保结果在CPU上
