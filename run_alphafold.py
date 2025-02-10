@@ -55,6 +55,7 @@ import numpy as np
 import psutil
 import GPUtil
 from concurrent.futures import ProcessPoolExecutor
+import tensorflow as tf
 
 
 _HOME_DIR = pathlib.Path(os.environ.get('HOME'))
@@ -845,12 +846,47 @@ class DynamicGPUModelRunner(ModelRunner):
         print(f"Inference completed on GPU {self._worker_gpu}")
         return result
 
+def reserve_gpu_memory(gpu_id: int, memory_fraction: float = 0.3):
+    """在指定GPU上预留显存
+    
+    Args:
+        gpu_id: GPU ID
+        memory_fraction: 要预留的显存比例（默认0.3，约5GB在16GB显卡上）
+    """
+    # 临时设置环境变量以访问指定GPU
+    original_cuda_visible_devices = os.environ.get('CUDA_VISIBLE_DEVICES')
+    os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
+    
+    try:
+        # 创建TensorFlow配置
+        gpus = tf.config.list_physical_devices('GPU')
+        if gpus:
+            # 限制TensorFlow只使用一部分显存
+            tf.config.set_logical_device_configuration(
+                gpus[0],
+                [tf.config.LogicalDeviceConfiguration(memory_limit=int(16384 * memory_fraction))]  # 假设是16GB显卡
+            )
+            # 分配一个持续存在的张量来预留显存
+            placeholder = tf.random.normal([int(8192 * memory_fraction), 1024])  # 创建大张量
+            print(f"Successfully reserved {memory_fraction*100:.1f}% memory on GPU {gpu_id}")
+    except Exception as e:
+        print(f"Failed to reserve memory on GPU {gpu_id}: {e}")
+    finally:
+        # 恢复原始环境变量
+        if original_cuda_visible_devices is not None:
+            os.environ['CUDA_VISIBLE_DEVICES'] = original_cuda_visible_devices
+        else:
+            del os.environ['CUDA_VISIBLE_DEVICES']
+
 def main(_):
+    # 在程序开始时就在GPU 1上预留显存
+    reserve_gpu_memory(_WORKER_GPU.value)
+    
     # 主进程使用 GPU 0，允许预分配显存以提高性能
     os.environ['CUDA_VISIBLE_DEVICES'] = str(_MAIN_GPU.value)
     # GPU 0 的显存管理：允许预分配，但限制使用量
-    os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '0.8'  # 使用80%显存
-    os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'true'  # 允许预分配
+    os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '0.8'
+    os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'true'
     
     if _JAX_COMPILATION_CACHE_DIR.value is not None:
         jax.config.update(
