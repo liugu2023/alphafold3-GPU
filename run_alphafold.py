@@ -850,22 +850,30 @@ def run_inference_process(
     is_worker_gpu: bool = False,
 ) -> model.ModelResult:
     """在显存占用较低的GPU上运行推理"""
-    # 选择显存占用较低的GPU
     try:
+        # 1. 选择显存占用较低的GPU
         target_gpu = select_gpu_for_inference(main_gpu, worker_gpu)
         print(f"Selected GPU {target_gpu} for inference")
         
-        # 继承对应GPU上的预留进程
+        # 2. 设置环境变量
         os.environ['CUDA_VISIBLE_DEVICES'] = str(target_gpu)
         
-        # 设置JAX配置
+        # 3. 再次检查显存状态
+        used, total = get_gpu_memory_info(target_gpu)
+        free = total - used
+        print(f"GPU {target_gpu} memory before model creation: {used:.1f}GB/{total:.1f}GB (Free: {free:.1f}GB)")
+        
+        if free < 8:  # 如果可用显存小于8GB，提前终止
+            raise RuntimeError(f"Insufficient GPU memory before model creation: only {free:.1f}GB available")
+        
+        # 4. 设置JAX配置
         os.environ.update({
             'XLA_PYTHON_CLIENT_MEM_FRACTION': '0.95',
             'XLA_PYTHON_CLIENT_PREALLOCATE': 'false',
             'XLA_PYTHON_CLIENT_ALLOCATOR': 'platform',
         })
         
-        # 创建模型实例
+        # 5. 创建模型实例
         devices = jax.devices('gpu')
         if not devices:
             raise RuntimeError("No GPU devices found")
@@ -877,12 +885,17 @@ def run_inference_process(
         )
         print("Successfully created model runner")
         
-        # 运行推理
+        # 6. 再次检查显存状态
+        used, total = get_gpu_memory_info(target_gpu)
+        free = total - used
+        print(f"GPU {target_gpu} memory after model creation: {used:.1f}GB/{total:.1f}GB (Free: {free:.1f}GB)")
+        
+        # 7. 运行推理
         print("Starting inference...")
         result = inference_model.run_inference(featurised_example, rng_key)
         print("Inference completed successfully")
         
-        # 确保结果在CPU上
+        # 8. 确保结果在CPU上
         result = jax.tree_util.tree_map(
             lambda x: np.array(x) if isinstance(x, (np.ndarray, jnp.ndarray)) else x,
             result
@@ -892,6 +905,8 @@ def run_inference_process(
         
     except Exception as e:
         print(f"Error in inference process: {str(e)}")
+        used, total = get_gpu_memory_info(target_gpu)
+        print(f"GPU {target_gpu} memory at error: {used:.1f}GB/{total:.1f}GB (Free: {total-used:.1f}GB)")
         raise
 
 def main(_):
