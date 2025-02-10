@@ -821,6 +821,27 @@ def select_gpu_for_inference(main_gpu: int, worker_gpu: int) -> int:
     else:
         raise RuntimeError(f"No GPU has enough free memory (need at least {MIN_REQUIRED_MEMORY}GB)")
 
+def create_gpu_process(gpu_id: int) -> None:
+    """在指定GPU上创建预留进程并预留少量显存
+    
+    Args:
+        gpu_id: GPU ID
+    """
+    # 设置环境变量
+    os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
+    
+    try:
+        # 预留128MB显存
+        placeholder = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device='cuda')
+        placeholder.record_stream(torch.cuda.current_stream())
+        print(f"Created placeholder process on GPU {gpu_id}")
+        
+        # 保持进程运行
+        while True:
+            time.sleep(1)
+    except Exception as e:
+        print(f"Error creating placeholder process on GPU {gpu_id}: {e}")
+
 def run_inference_process(
     featurised_example: features.BatchDict,
     rng_key: jnp.ndarray,
@@ -836,22 +857,15 @@ def run_inference_process(
         target_gpu = select_gpu_for_inference(main_gpu, worker_gpu)
         print(f"Selected GPU {target_gpu} for inference")
         
-        # 设置环境变量
+        # 继承对应GPU上的预留进程
         os.environ['CUDA_VISIBLE_DEVICES'] = str(target_gpu)
-        torch.cuda.set_device(0)
         
-        # 设置JAX配置 - 增加显存限制
+        # 设置JAX配置
         os.environ.update({
-            'XLA_PYTHON_CLIENT_MEM_FRACTION': '0.95',  # 允许使用更多显存
+            'XLA_PYTHON_CLIENT_MEM_FRACTION': '0.95',
             'XLA_PYTHON_CLIENT_PREALLOCATE': 'false',
             'XLA_PYTHON_CLIENT_ALLOCATOR': 'platform',
-            'XLA_PYTHON_CLIENT_MEM_LIMIT_MB': '14000',  # 限制最大显存使用
-            'XLA_GPU_STRICT_CONV_ALGORITHM': 'true'  # 使用较少显存的卷积算法
         })
-        
-        # 清理显存
-        torch.cuda.empty_cache()
-        jax.clear_caches()
         
         # 创建模型实例
         devices = jax.devices('gpu')
@@ -865,301 +879,235 @@ def run_inference_process(
         )
         print("Successfully created model runner")
         
-        # 运行推理前再次检查显存
-        used, total = get_gpu_memory_info(target_gpu)
-        free = total - used
-        print(f"GPU {target_gpu} memory before inference: Used={used:.1f}GB, Free={free:.1f}GB")
-        
-        if free < 8:  # 如果可用显存小于8GB，抛出错误
-            raise RuntimeError(f"Insufficient GPU memory: only {free:.1f}GB available")
-        
         # 运行推理
         print("Starting inference...")
         result = inference_model.run_inference(featurised_example, rng_key)
         print("Inference completed successfully")
         
-        # 确保结果在CPU上并清理GPU显存
+        # 确保结果在CPU上
         result = jax.tree_util.tree_map(
             lambda x: np.array(x) if isinstance(x, (np.ndarray, jnp.ndarray)) else x,
             result
         )
         
-        # 清理显存
-        del inference_model
-        torch.cuda.empty_cache()
-        jax.clear_caches()
-        
         return result
         
     except Exception as e:
         print(f"Error in inference process: {str(e)}")
-        print(f"Current GPU memory usage: {torch.cuda.memory_allocated()/1024/1024/1024:.2f}GB")
-        print(f"Max GPU memory usage: {torch.cuda.max_memory_allocated()/1024/1024/1024:.2f}GB")
         raise
-
-class DynamicGPUModelRunner(ModelRunner):
-    def __init__(self, *args, **kwargs):
-        # 保存初始化参数
-        self._model_config = kwargs['config']
-        self._model_dir = kwargs['model_dir']
-        self._worker_gpu = _WORKER_GPU.value
-        
-        # 主进程在 GPU 0 上使用预分配
-        os.environ['CUDA_VISIBLE_DEVICES'] = str(_MAIN_GPU.value)
-        os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'true'
-        os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '0.8'
-        os.environ['XLA_PYTHON_CLIENT_ALLOCATOR'] = 'default'
-        
-        super().__init__(*args, **kwargs)
-        
-    def run_inference(self, featurised_example: features.BatchDict, rng_key: jnp.ndarray) -> model.ModelResult:
-        """使用子进程在GPU 1上运行推理"""
-        print(f"Starting inference process on GPU {self._worker_gpu}")
-        
-        # 使用multiprocessing启动推理进程
-        ctx = multiprocessing.get_context('spawn')
-        with ctx.Pool(1) as pool:
-            result = pool.apply(
-                run_inference_process,
-                args=(
-                    featurised_example,
-                    rng_key,
-                    self._model_config,
-                    self._model_dir,
-                    self._worker_gpu,
-                    True,  # 标记这是worker GPU
-                )
-            )
-        
-        print(f"Inference completed on GPU {self._worker_gpu}")
-        return result
-
-def reserve_gpu_memory(gpu_id: int, memory_fraction: float = 0.3):
-    """在指定GPU上预留显存
-    
-    Args:
-        gpu_id: GPU ID
-        memory_fraction: 要预留的显存比例（默认0.3，约5GB在16GB显卡上）
-    """
-    # 临时设置环境变量以访问指定GPU
-    original_cuda_visible_devices = os.environ.get('CUDA_VISIBLE_DEVICES')
-    os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
-    
-    try:
-        # 确保PyTorch使用指定的GPU
-        torch.cuda.set_device(0)  # 因为设置了CUDA_VISIBLE_DEVICES，所以这里用0
-        
-        # 获取GPU总显存
-        total_memory = torch.cuda.get_device_properties(0).total_memory
-        target_memory = int(total_memory * memory_fraction)
-        
-        # 创建一个大张量来预留显存
-        # 使用固定内存以确保不会被释放
-        placeholder = torch.empty(target_memory, dtype=torch.int8, device='cuda')
-        torch.cuda.empty_cache()  # 清理可能的碎片
-        
-        print(f"Successfully reserved {memory_fraction*100:.1f}% memory ({target_memory/1024/1024/1024:.1f}GB) on GPU {gpu_id}")
-        
-        # 保持张量存活
-        placeholder.record_stream(torch.cuda.current_stream())
-        
-    except Exception as e:
-        print(f"Failed to reserve memory on GPU {gpu_id}: {e}")
-    finally:
-        # 恢复原始环境变量
-        if original_cuda_visible_devices is not None:
-            os.environ['CUDA_VISIBLE_DEVICES'] = original_cuda_visible_devices
-        else:
-            del os.environ['CUDA_VISIBLE_DEVICES']
 
 def main(_):
-    # 在程序开始时就在GPU 1上预留显存
-    reserve_gpu_memory(_WORKER_GPU.value, memory_fraction=0.3)  # 预留30%显存（约5GB在16GB显卡上）
-    
-    # 主进程使用 GPU 0，允许预分配显存以提高性能
-    os.environ['CUDA_VISIBLE_DEVICES'] = str(_MAIN_GPU.value)
-    # GPU 0 的显存管理：允许预分配，但限制使用量
-    os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '0.8'
-    os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'true'
-    
-    if _JAX_COMPILATION_CACHE_DIR.value is not None:
-        jax.config.update(
-            'jax_compilation_cache_dir', _JAX_COMPILATION_CACHE_DIR.value
-        )
-
-    if _JSON_PATH.value is None == _INPUT_DIR.value is None:
-        raise ValueError(
-            'Exactly one of --json_path or --input_dir must be specified.'
-        )
-
-    if not _RUN_INFERENCE.value and not _RUN_DATA_PIPELINE.value:
-        raise ValueError(
-            'At least one of --run_inference or --run_data_pipeline must be'
-            ' set to true.'
-        )
-
-    if _INPUT_DIR.value is not None:
-        fold_inputs = folding_input.load_fold_inputs_from_dir(
-            pathlib.Path(_INPUT_DIR.value)
-        )
-        print(f"Found {len(list(fold_inputs))} input files in {_INPUT_DIR.value}")
-    elif _JSON_PATH.value is not None:
-        fold_inputs = folding_input.load_fold_inputs_from_path(
-            pathlib.Path(_JSON_PATH.value)
-        )
-        print(f"Loading input from {_JSON_PATH.value}")
-    else:
-        raise AssertionError(
-            'Exactly one of --json_path or --input_dir must be specified.'
-        )
-
-    # 验证输入文件是否为空
-    fold_input_list = list(fold_inputs)
-    if not fold_input_list:
-        raise ValueError(f"No valid input files found in the specified location")
-    
-    print(f"Total number of inputs to process: {len(fold_input_list)}")
-
-    # Make sure we can create the output directory before running anything.
-    try:
-        os.makedirs(_OUTPUT_DIR.value, exist_ok=True)
-    except OSError as e:
-        print(f'Failed to create output directory {_OUTPUT_DIR.value}: {e}')
-        raise
-
-    if _RUN_INFERENCE.value:
-        # Fail early on incompatible devices, but only if we're running inference.
-        gpu_devices = jax.local_devices(backend='gpu')
-        if gpu_devices:
-            compute_capability = float(
-                gpu_devices[_GPU_DEVICE.value].compute_capability
-            )
-            if compute_capability < 6.0:
-                raise ValueError(
-                    'AlphaFold 3 requires at least GPU compute capability 6.0 (see'
-                    ' https://developer.nvidia.com/cuda-gpus).'
-                )
-            elif 7.0 <= compute_capability < 8.0:
-                xla_flags = os.environ.get('XLA_FLAGS')
-                required_flag = '--xla_disable_hlo_passes=custom-kernel-fusion-rewriter'
-                if not xla_flags or required_flag not in xla_flags:
-                    raise ValueError(
-                        'For devices with GPU compute capability 7.x (see'
-                        ' https://developer.nvidia.com/cuda-gpus) the ENV XLA_FLAGS must'
-                        f' include "{required_flag}".'
-                    )
-                if _FLASH_ATTENTION_IMPLEMENTATION.value != 'xla':
-                    raise ValueError(
-                        'For devices with GPU compute capability 7.x (see'
-                        ' https://developer.nvidia.com/cuda-gpus) the'
-                        ' --flash_attention_implementation must be set to "xla".'
-                    )
-
-    notice = textwrap.wrap(
-        'Running AlphaFold 3. Please note that standard AlphaFold 3 model'
-        ' parameters are only available under terms of use provided at'
-        ' https://github.com/google-deepmind/alphafold3/blob/main/WEIGHTS_TERMS_OF_USE.md.'
-        ' If you do not agree to these terms and are using AlphaFold 3 derived'
-        ' model parameters, cancel execution of AlphaFold 3 inference with'
-        ' CTRL-C, and do not use the model parameters.',
-        break_long_words=False,
-        break_on_hyphens=False,
-        width=80,
+    # 在两个GPU上创建预留进程
+    gpu0_process = multiprocessing.Process(
+        target=create_gpu_process,
+        args=(_MAIN_GPU.value,)
     )
-    print('\n' + '\n'.join(notice) + '\n')
-
-    if _RUN_DATA_PIPELINE.value:
-        expand_path = lambda x: replace_db_dir(x, DB_DIR.value)
-        max_template_date = datetime.date.fromisoformat(_MAX_TEMPLATE_DATE.value)
-        data_pipeline_config = pipeline.DataPipelineConfig(
-            jackhmmer_binary_path=_JACKHMMER_BINARY_PATH.value,
-            nhmmer_binary_path=_NHMMER_BINARY_PATH.value,
-            hmmalign_binary_path=_HMMALIGN_BINARY_PATH.value,
-            hmmsearch_binary_path=_HMMSEARCH_BINARY_PATH.value,
-            hmmbuild_binary_path=_HMMBUILD_BINARY_PATH.value,
-            small_bfd_database_path=expand_path(_SMALL_BFD_DATABASE_PATH.value),
-            mgnify_database_path=expand_path(_MGNIFY_DATABASE_PATH.value),
-            uniprot_cluster_annot_database_path=expand_path(
-                _UNIPROT_CLUSTER_ANNOT_DATABASE_PATH.value
-            ),
-            uniref90_database_path=expand_path(_UNIREF90_DATABASE_PATH.value),
-            ntrna_database_path=expand_path(_NTRNA_DATABASE_PATH.value),
-            rfam_database_path=expand_path(_RFAM_DATABASE_PATH.value),
-            rna_central_database_path=expand_path(_RNA_CENTRAL_DATABASE_PATH.value),
-            pdb_database_path=expand_path(_PDB_DATABASE_PATH.value),
-            seqres_database_path=expand_path(_SEQRES_DATABASE_PATH.value),
-            jackhmmer_n_cpu=_JACKHMMER_N_CPU.value,
-            nhmmer_n_cpu=_NHMMER_N_CPU.value,
-            max_template_date=max_template_date,
-        )
-    else:
-        data_pipeline_config = None
-
-    if _RUN_INFERENCE.value:
-        try:
-            devices = jax.local_devices(backend='gpu')
-            if not devices:
-                raise RuntimeError("No GPU devices found")
-            
-            print(f'Main process using GPU {_MAIN_GPU.value}')
-            print(f'Will use GPU {_WORKER_GPU.value} for inference')
-            
-            # 检查GPU是否可用
-            for gpu_id in [_MAIN_GPU.value, _WORKER_GPU.value]:
-                mem = get_available_gpu_memory(gpu_id)
-                print(f"GPU {gpu_id} available memory: {mem:.2f}GB")
-                if mem < 1:
-                    print(f"Warning: GPU {gpu_id} has very low available memory!")
-            
-            # 检查模型目录
-            model_path = pathlib.Path(MODEL_DIR.value)
-            if not model_path.exists():
-                raise FileNotFoundError(f"Model directory not found: {model_path}")
-            print(f"Using model directory: {model_path}")
-            
-            # 创建模型运行器
-            print('Building model from scratch...')
-            model_runner = DynamicGPUModelRunner(
-                config=make_model_config(
-                    flash_attention_implementation=typing.cast(
-                        attention.Implementation, _FLASH_ATTENTION_IMPLEMENTATION.value
-                    ),
-                    num_diffusion_samples=_NUM_DIFFUSION_SAMPLES.value,
-                    num_recycles=_NUM_RECYCLES.value,
-                    return_embeddings=_SAVE_EMBEDDINGS.value,
-                ),
-                device=devices[0],
-                model_dir=pathlib.Path(MODEL_DIR.value),
+    gpu1_process = multiprocessing.Process(
+        target=create_gpu_process,
+        args=(_WORKER_GPU.value,)
+    )
+    
+    gpu0_process.start()
+    gpu1_process.start()
+    
+    # 等待进程创建完成
+    time.sleep(2)
+    
+    try:
+        # 在程序开始时就在GPU 1上预留显存
+        reserve_gpu_memory(_WORKER_GPU.value, memory_fraction=0.3)  # 预留30%显存（约5GB在16GB显卡上）
+        
+        # 主进程使用 GPU 0，允许预分配显存以提高性能
+        os.environ['CUDA_VISIBLE_DEVICES'] = str(_MAIN_GPU.value)
+        # GPU 0 的显存管理：允许预分配，但限制使用量
+        os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '0.8'
+        os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'true'
+        
+        if _JAX_COMPILATION_CACHE_DIR.value is not None:
+            jax.config.update(
+                'jax_compilation_cache_dir', _JAX_COMPILATION_CACHE_DIR.value
             )
-            
-            # 处理输入
-            num_fold_inputs = 0
-            for fold_input in fold_input_list:
-                try:
-                    if _NUM_SEEDS.value is not None:
-                        print(f'Expanding fold job {fold_input.name} to {_NUM_SEEDS.value} seeds')
-                        fold_input = fold_input.with_multiple_seeds(_NUM_SEEDS.value)
-                    process_fold_input(
-                        fold_input=fold_input,
-                        data_pipeline_config=data_pipeline_config,
-                        model_runner=model_runner,
-                        output_dir=os.path.join(_OUTPUT_DIR.value, fold_input.sanitised_name()),
-                        buckets=tuple(int(bucket) for bucket in _BUCKETS.value),
-                        conformer_max_iterations=_CONFORMER_MAX_ITERATIONS.value,
-                        main_gpu=_MAIN_GPU.value,
-                        worker_gpu=_WORKER_GPU.value,
-                    )
-                    num_fold_inputs += 1
-                    print(f"Processed {num_fold_inputs}/{len(fold_input_list)} inputs")
-                except Exception as e:
-                    print(f"Error processing input {fold_input.name}: {str(e)}")
-                    raise
 
-        except Exception as e:
-            print(f"Fatal error during inference: {str(e)}")
+        if _JSON_PATH.value is None == _INPUT_DIR.value is None:
+            raise ValueError(
+                'Exactly one of --json_path or --input_dir must be specified.'
+            )
+
+        if not _RUN_INFERENCE.value and not _RUN_DATA_PIPELINE.value:
+            raise ValueError(
+                'At least one of --run_inference or --run_data_pipeline must be'
+                ' set to true.'
+            )
+
+        if _INPUT_DIR.value is not None:
+            fold_inputs = folding_input.load_fold_inputs_from_dir(
+                pathlib.Path(_INPUT_DIR.value)
+            )
+            print(f"Found {len(list(fold_inputs))} input files in {_INPUT_DIR.value}")
+        elif _JSON_PATH.value is not None:
+            fold_inputs = folding_input.load_fold_inputs_from_path(
+                pathlib.Path(_JSON_PATH.value)
+            )
+            print(f"Loading input from {_JSON_PATH.value}")
+        else:
+            raise AssertionError(
+                'Exactly one of --json_path or --input_dir must be specified.'
+            )
+
+        # 验证输入文件是否为空
+        fold_input_list = list(fold_inputs)
+        if not fold_input_list:
+            raise ValueError(f"No valid input files found in the specified location")
+        
+        print(f"Total number of inputs to process: {len(fold_input_list)}")
+
+        # Make sure we can create the output directory before running anything.
+        try:
+            os.makedirs(_OUTPUT_DIR.value, exist_ok=True)
+        except OSError as e:
+            print(f'Failed to create output directory {_OUTPUT_DIR.value}: {e}')
             raise
 
-    print(f'All jobs completed successfully')
+        if _RUN_INFERENCE.value:
+            # Fail early on incompatible devices, but only if we're running inference.
+            gpu_devices = jax.local_devices(backend='gpu')
+            if gpu_devices:
+                compute_capability = float(
+                    gpu_devices[_GPU_DEVICE.value].compute_capability
+                )
+                if compute_capability < 6.0:
+                    raise ValueError(
+                        'AlphaFold 3 requires at least GPU compute capability 6.0 (see'
+                        ' https://developer.nvidia.com/cuda-gpus).'
+                    )
+                elif 7.0 <= compute_capability < 8.0:
+                    xla_flags = os.environ.get('XLA_FLAGS')
+                    required_flag = '--xla_disable_hlo_passes=custom-kernel-fusion-rewriter'
+                    if not xla_flags or required_flag not in xla_flags:
+                        raise ValueError(
+                            'For devices with GPU compute capability 7.x (see'
+                            ' https://developer.nvidia.com/cuda-gpus) the ENV XLA_FLAGS must'
+                            f' include "{required_flag}".'
+                        )
+                    if _FLASH_ATTENTION_IMPLEMENTATION.value != 'xla':
+                        raise ValueError(
+                            'For devices with GPU compute capability 7.x (see'
+                            ' https://developer.nvidia.com/cuda-gpus) the'
+                            ' --flash_attention_implementation must be set to "xla".'
+                        )
+
+        notice = textwrap.wrap(
+            'Running AlphaFold 3. Please note that standard AlphaFold 3 model'
+            ' parameters are only available under terms of use provided at'
+            ' https://github.com/google-deepmind/alphafold3/blob/main/WEIGHTS_TERMS_OF_USE.md.'
+            ' If you do not agree to these terms and are using AlphaFold 3 derived'
+            ' model parameters, cancel execution of AlphaFold 3 inference with'
+            ' CTRL-C, and do not use the model parameters.',
+            break_long_words=False,
+            break_on_hyphens=False,
+            width=80,
+        )
+        print('\n' + '\n'.join(notice) + '\n')
+
+        if _RUN_DATA_PIPELINE.value:
+            expand_path = lambda x: replace_db_dir(x, DB_DIR.value)
+            max_template_date = datetime.date.fromisoformat(_MAX_TEMPLATE_DATE.value)
+            data_pipeline_config = pipeline.DataPipelineConfig(
+                jackhmmer_binary_path=_JACKHMMER_BINARY_PATH.value,
+                nhmmer_binary_path=_NHMMER_BINARY_PATH.value,
+                hmmalign_binary_path=_HMMALIGN_BINARY_PATH.value,
+                hmmsearch_binary_path=_HMMSEARCH_BINARY_PATH.value,
+                hmmbuild_binary_path=_HMMBUILD_BINARY_PATH.value,
+                small_bfd_database_path=expand_path(_SMALL_BFD_DATABASE_PATH.value),
+                mgnify_database_path=expand_path(_MGNIFY_DATABASE_PATH.value),
+                uniprot_cluster_annot_database_path=expand_path(
+                    _UNIPROT_CLUSTER_ANNOT_DATABASE_PATH.value
+                ),
+                uniref90_database_path=expand_path(_UNIREF90_DATABASE_PATH.value),
+                ntrna_database_path=expand_path(_NTRNA_DATABASE_PATH.value),
+                rfam_database_path=expand_path(_RFAM_DATABASE_PATH.value),
+                rna_central_database_path=expand_path(_RNA_CENTRAL_DATABASE_PATH.value),
+                pdb_database_path=expand_path(_PDB_DATABASE_PATH.value),
+                seqres_database_path=expand_path(_SEQRES_DATABASE_PATH.value),
+                jackhmmer_n_cpu=_JACKHMMER_N_CPU.value,
+                nhmmer_n_cpu=_NHMMER_N_CPU.value,
+                max_template_date=max_template_date,
+            )
+        else:
+            data_pipeline_config = None
+
+        if _RUN_INFERENCE.value:
+            try:
+                devices = jax.local_devices(backend='gpu')
+                if not devices:
+                    raise RuntimeError("No GPU devices found")
+                
+                print(f'Main process using GPU {_MAIN_GPU.value}')
+                print(f'Will use GPU {_WORKER_GPU.value} for inference')
+                
+                # 检查GPU是否可用
+                for gpu_id in [_MAIN_GPU.value, _WORKER_GPU.value]:
+                    mem = get_available_gpu_memory(gpu_id)
+                    print(f"GPU {gpu_id} available memory: {mem:.2f}GB")
+                    if mem < 1:
+                        print(f"Warning: GPU {gpu_id} has very low available memory!")
+                
+                # 检查模型目录
+                model_path = pathlib.Path(MODEL_DIR.value)
+                if not model_path.exists():
+                    raise FileNotFoundError(f"Model directory not found: {model_path}")
+                print(f"Using model directory: {model_path}")
+                
+                # 创建模型运行器
+                print('Building model from scratch...')
+                model_runner = DynamicGPUModelRunner(
+                    config=make_model_config(
+                        flash_attention_implementation=typing.cast(
+                            attention.Implementation, _FLASH_ATTENTION_IMPLEMENTATION.value
+                        ),
+                        num_diffusion_samples=_NUM_DIFFUSION_SAMPLES.value,
+                        num_recycles=_NUM_RECYCLES.value,
+                        return_embeddings=_SAVE_EMBEDDINGS.value,
+                    ),
+                    device=devices[0],
+                    model_dir=pathlib.Path(MODEL_DIR.value),
+                )
+                
+                # 处理输入
+                num_fold_inputs = 0
+                for fold_input in fold_input_list:
+                    try:
+                        if _NUM_SEEDS.value is not None:
+                            print(f'Expanding fold job {fold_input.name} to {_NUM_SEEDS.value} seeds')
+                            fold_input = fold_input.with_multiple_seeds(_NUM_SEEDS.value)
+                        process_fold_input(
+                            fold_input=fold_input,
+                            data_pipeline_config=data_pipeline_config,
+                            model_runner=model_runner,
+                            output_dir=os.path.join(_OUTPUT_DIR.value, fold_input.sanitised_name()),
+                            buckets=tuple(int(bucket) for bucket in _BUCKETS.value),
+                            conformer_max_iterations=_CONFORMER_MAX_ITERATIONS.value,
+                            main_gpu=_MAIN_GPU.value,
+                            worker_gpu=_WORKER_GPU.value,
+                        )
+                        num_fold_inputs += 1
+                        print(f"Processed {num_fold_inputs}/{len(fold_input_list)} inputs")
+                    except Exception as e:
+                        print(f"Error processing input {fold_input.name}: {str(e)}")
+                        raise
+
+            except Exception as e:
+                print(f"Fatal error during inference: {str(e)}")
+                raise
+
+        print(f'All jobs completed successfully')
+
+    finally:
+        # 确保清理预留进程
+        gpu0_process.terminate()
+        gpu1_process.terminate()
+        gpu0_process.join()
+        gpu1_process.join()
 
 
 if __name__ == '__main__':
