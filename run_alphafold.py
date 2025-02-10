@@ -845,9 +845,9 @@ def run_inference_process(
         gpu0_free = gpu0_total - gpu0_used
         gpu1_free = gpu1_total - gpu1_used
         
-        print(f"Initial GPU memory status:")
-        print(f"GPU {main_gpu}: {gpu0_used:.1f}GB/{gpu0_total:.1f}GB (Free: {gpu0_free:.1f}GB)")
-        print(f"GPU {worker_gpu}: {gpu1_used:.1f}GB/{gpu1_total:.1f}GB (Free: {gpu1_free:.1f}GB)")
+        print("\n=== GPU Memory Status Before Selection ===")
+        print(f"GPU {main_gpu}: Used={gpu0_used:.1f}GB/Total={gpu0_total:.1f}GB (Free: {gpu0_free:.1f}GB)")
+        print(f"GPU {worker_gpu}: Used={gpu1_used:.1f}GB/Total={gpu1_total:.1f}GB (Free: {gpu1_free:.1f}GB)")
         
         # 2. 检查是否有足够显存并选择GPU
         MIN_REQUIRED_MEMORY = 8.0
@@ -859,6 +859,7 @@ def run_inference_process(
         
         # 3. 选择显存较多的GPU
         selected_gpu = main_gpu if gpu0_free > gpu1_free else worker_gpu
+        print(f"\n=== GPU Selection Result ===")
         print(f"Selected GPU {selected_gpu} with {max(gpu0_free, gpu1_free):.1f}GB free memory")
         
         # 4. 清理JAX缓存
@@ -884,9 +885,16 @@ def run_inference_process(
         devices = jax.devices('gpu')
         if not devices:
             raise RuntimeError("No GPU devices found")
+        print(f"\n=== JAX Initialization Status ===")
         print(f"JAX initialized with devices: {devices}")
         print(f"Current CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES')}")
         print(f"Current JAX backend: {jax.default_backend()}")
+        
+        # 再次检查选定GPU的显存状态
+        used, total = get_gpu_memory_info(selected_gpu)
+        free = total - used
+        print(f"\n=== Selected GPU Status After JAX Init ===")
+        print(f"GPU {selected_gpu}: Used={used:.1f}GB/Total={total:.1f}GB (Free: {free:.1f}GB)")
         
         # 8. 创建模型实例
         with jax.default_device(devices[0]):  # 只有一个设备，所以用devices[0]
