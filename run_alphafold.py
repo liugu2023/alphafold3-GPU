@@ -447,31 +447,33 @@ def predict_structure(
     jax.clear_caches()        # 清理JAX缓存
     gc.collect()              # 强制垃圾回收
     
-    # 4. 再次检查显存状态
+    # 4. 在GPU0上初始化JAX
+    print("\n=== Initializing JAX on GPU 0 ===")
+    os.environ['CUDA_VISIBLE_DEVICES'] = str(main_gpu)
+    os.environ.update({
+        'XLA_PYTHON_CLIENT_MEM_FRACTION': '0.95',
+        'XLA_PYTHON_CLIENT_PREALLOCATE': 'true',
+        'XLA_PYTHON_CLIENT_ALLOCATOR': 'platform',
+        'XLA_FORCE_HOST_PLATFORM_DEVICE_COUNT': '1',
+        'TF_FORCE_GPU_ALLOW_GROWTH': 'false',
+        'XLA_PYTHON_CLIENT_MEM_LIMIT_MB': '14000',
+    })
+    
+    # 5. 重新检查显存状态
     gpu0_used, gpu0_total = get_gpu_memory_info(main_gpu)
     gpu1_used, gpu1_total = get_gpu_memory_info(worker_gpu)
     gpu0_free = gpu0_total - gpu0_used
     gpu1_free = gpu1_total - gpu1_used
     
-    print("\n=== GPU Memory Status After Cleanup ===")
+    print("\n=== GPU Memory Status After JAX Init ===")
     print(f"GPU {main_gpu}: Used={gpu0_used:.1f}GB/Total={gpu0_total:.1f}GB (Free: {gpu0_free:.1f}GB)")
     print(f"GPU {worker_gpu}: Used={gpu1_used:.1f}GB/Total={gpu1_total:.1f}GB (Free: {gpu1_free:.1f}GB)")
     
-    # 5. 检查是否有足够显存并选择GPU
+    # 6. 选择显存较多的GPU进行推理
     MIN_REQUIRED_MEMORY = 8.0
-    if max(gpu0_free, gpu1_free) < MIN_REQUIRED_MEMORY:
-        raise RuntimeError(
-            f"No GPU has enough free memory after cleanup (need at least {MIN_REQUIRED_MEMORY}GB). "
-            f"GPU {main_gpu}: {gpu0_free:.1f}GB free, GPU {worker_gpu}: {gpu1_free:.1f}GB free"
-        )
-    
-    # 6. 选择显存较多的GPU
-    selected_gpu = main_gpu if gpu0_free > gpu1_free else worker_gpu
+    selected_gpu = worker_gpu if gpu1_free >= MIN_REQUIRED_MEMORY else main_gpu
     print(f"\n=== GPU Selection Result ===")
-    print(f"Selected GPU {selected_gpu} with {max(gpu0_free, gpu1_free):.1f}GB free memory")
-    
-    # 7. 设置环境变量 - 只让JAX看到选中的GPU
-    os.environ['CUDA_VISIBLE_DEVICES'] = str(selected_gpu)
+    print(f"Selected GPU {selected_gpu} for inference")
     
     # 创建进程池用于推理
     ctx = multiprocessing.get_context('spawn')
@@ -479,10 +481,8 @@ def predict_structure(
         for seed, example in zip(fold_input.rng_seeds, featurised_examples):
             print(f'Running inference for seed {seed}...')
             
-            # 为每个seed创建rng_key
             rng_key = jax.random.PRNGKey(seed)
             
-            # 在子进程中运行推理
             result = pool.apply(
                 run_inference_process,
                 args=(
@@ -490,7 +490,7 @@ def predict_structure(
                     rng_key,
                     model_runner._model_config,
                     model_runner._model_dir,
-                    selected_gpu,  # 直接使用选定的GPU
+                    selected_gpu,
                 )
             )
             
