@@ -471,6 +471,8 @@ def predict_structure(
     
     # 4. 在GPU0上初始化JAX
     print("\n=== Initializing JAX on GPU 0 ===")
+    print(f"Current CUDA_VISIBLE_DEVICES before JAX init: {os.environ.get('CUDA_VISIBLE_DEVICES', 'Not set')}")
+    
     os.environ['CUDA_VISIBLE_DEVICES'] = str(main_gpu)
     os.environ.update({
         'XLA_PYTHON_CLIENT_MEM_FRACTION': '0.95',
@@ -480,6 +482,29 @@ def predict_structure(
         'TF_FORCE_GPU_ALLOW_GROWTH': 'false',
         'XLA_PYTHON_CLIENT_MEM_LIMIT_MB': '14000',
     })
+    
+    # 重新初始化JAX并输出设备信息
+    jax.clear_caches()
+    import importlib
+    importlib.reload(jax.lib)
+    importlib.reload(jax)
+    
+    print("\n=== JAX Device Information ===")
+    print(f"JAX backend: {jax.default_backend()}")
+    print(f"All visible devices to JAX: {jax.devices()}")
+    print(f"Default device: {jax.default_device()}")
+    print(f"Current CUDA_VISIBLE_DEVICES after JAX init: {os.environ.get('CUDA_VISIBLE_DEVICES', 'Not set')}")
+    
+    try:
+        gpu_devices = jax.devices('gpu')
+        print(f"Available GPU devices to JAX: {gpu_devices}")
+        for device in gpu_devices:
+            print(f"  - Device: {device}")
+            print(f"    Platform: {device.platform}")
+            print(f"    Device kind: {device.device_kind}")
+            print(f"    Device ID: {device.id}")
+    except Exception as e:
+        print(f"Error getting GPU device information: {e}")
     
     # 5. 重新检查显存状态
     gpu0_used, gpu0_total = get_gpu_memory_info(main_gpu)
