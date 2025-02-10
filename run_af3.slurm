@@ -30,4 +30,6 @@ python /archive/liugu/alphafold3-GPU/run_alphafold.py \
   --model_dir=/archive/liugu/model \
   --norun_data_pipeline \
   --num_recycles=3 \
-  --flash_attention_implementation=xla
+  --flash_attention_implementation=xla \
+  --main_gpu=0 \
+  --worker_gpu=1 

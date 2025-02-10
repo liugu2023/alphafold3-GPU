@@ -403,70 +403,80 @@ class ResultsForSeed:
   embeddings: dict[str, np.ndarray] | None = None
 
 
+def predict_structure_on_gpu(
+    fold_input: folding_input.Input,
+    model_config: model.Model.Config,
+    model_dir: pathlib.Path,
+    gpu_id: int,
+    buckets: Sequence[int] | None = None,
+    conformer_max_iterations: int | None = None,
+) -> Sequence[ResultsForSeed]:
+    """在指定GPU上运行结构预测"""
+    # 设置环境变量限制GPU使用
+    os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
+    print(f"Structure prediction process running on GPU {gpu_id}")
+    
+    # 初始化设备
+    devices = jax.local_devices(backend='gpu')
+    if not devices:
+        raise RuntimeError(f"No GPU devices found for prediction process")
+    
+    # 创建模型实例
+    model_runner = ModelRunner(
+        config=model_config,
+        device=devices[0],
+        model_dir=model_dir
+    )
+    
+    # 运行预测
+    results = []
+    for seed in fold_input.rng_seeds:
+        print(f'Running inference for seed {seed}...')
+        example = featurise_input(fold_input, seed)
+        rng_key = jax.random.PRNGKey(seed)
+        
+        # 运行推理
+        result = model_runner.run_inference(example, rng_key)
+        
+        # 如果需要，运行构象生成
+        if conformer_max_iterations is not None:
+            result = run_conformer_generation(
+                result=result,
+                max_iterations=conformer_max_iterations,
+            )
+        
+        results.append(ResultsForSeed(seed=seed, result=result))
+    
+    # 确保结果在CPU上
+    results = [(r.seed, jax.tree_util.tree_map(
+        lambda x: np.array(x) if isinstance(x, (np.ndarray, jnp.ndarray)) else x,
+        r.result
+    )) for r in results]
+    
+    return [ResultsForSeed(seed=s, result=r) for s, r in results]
+
 def predict_structure(
     fold_input: folding_input.Input,
     model_runner: ModelRunner,
     buckets: Sequence[int] | None = None,
     conformer_max_iterations: int | None = None,
 ) -> Sequence[ResultsForSeed]:
-  """Runs the full inference pipeline to predict structures for each seed."""
-
-  print(f'Featurising data with {len(fold_input.rng_seeds)} seed(s)...')
-  featurisation_start_time = time.time()
-  ccd = chemical_components.cached_ccd(user_ccd=fold_input.user_ccd)
-  featurised_examples = featurisation.featurise_input(
-      fold_input=fold_input,
-      buckets=buckets,
-      ccd=ccd,
-      verbose=True,
-      conformer_max_iterations=conformer_max_iterations,
-  )
-  print(
-      f'Featurising data with {len(fold_input.rng_seeds)} seed(s) took'
-      f' {time.time() - featurisation_start_time:.2f} seconds.'
-  )
-  print(
-      'Running model inference and extracting output structure samples with'
-      f' {len(fold_input.rng_seeds)} seed(s)...'
-  )
-  all_inference_start_time = time.time()
-  all_inference_results = []
-  for seed, example in zip(fold_input.rng_seeds, featurised_examples):
-    print(f'Running model inference with seed {seed}...')
-    inference_start_time = time.time()
-    rng_key = jax.random.PRNGKey(seed)
-    result = model_runner.run_inference(example, rng_key)
-    print(
-        f'Running model inference with seed {seed} took'
-        f' {time.time() - inference_start_time:.2f} seconds.'
-    )
-    print(f'Extracting output structure samples with seed {seed}...')
-    extract_structures = time.time()
-    inference_results = model_runner.extract_structures(
-        batch=example, result=result, target_name=fold_input.name
-    )
-    print(
-        f'Extracting {len(inference_results)} output structure samples with'
-        f' seed {seed} took {time.time() - extract_structures:.2f} seconds.'
-    )
-
-    embeddings = model_runner.extract_embeddings(result)
-
-    all_inference_results.append(
-        ResultsForSeed(
-            seed=seed,
-            inference_results=inference_results,
-            full_fold_input=fold_input,
-            embeddings=embeddings,
+    """在GPU 1上运行结构预测"""
+    # 使用multiprocessing启动预测进程
+    ctx = multiprocessing.get_context('spawn')
+    with ctx.Pool(1) as pool:
+        result = pool.apply(
+            predict_structure_on_gpu,
+            args=(
+                fold_input,
+                model_runner._model_config,
+                model_runner._model_dir,
+                _WORKER_GPU.value,
+                buckets,
+                conformer_max_iterations,
+            )
         )
-    )
-  print(
-      'Running model inference and extracting output structures with'
-      f' {len(fold_input.rng_seeds)} seed(s) took'
-      f' {time.time() - all_inference_start_time:.2f} seconds.'
-  )
-  return all_inference_results
-
+    return result
 
 def write_fold_input_json(
     fold_input: folding_input.Input,
