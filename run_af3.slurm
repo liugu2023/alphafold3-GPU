@@ -32,5 +32,7 @@ python /archive/liugu/alphafold3-GPU/run_alphafold.py \
   --output_dir=/archive/liugu/output-GPU \
   --model_dir=/archive/liugu/model \
   --norun_data_pipeline \
+  --num_recycles=3 \
   --flash_attention_implementation=xla \
-  --num_recycles=3 
+  --main_gpu=0 \
+  --worker_gpu=1 
