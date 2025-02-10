@@ -761,26 +761,31 @@ class DynamicGPUModelRunner(ModelRunner):
         if len(self._devices) < 2:
             raise RuntimeError(f"Need at least 2 GPUs, found {len(self._devices)}")
         
-    def run_inference(self, featurised_example: features.BatchDict, rng_key: jnp.ndarray) -> model.ModelResult:
-        """在适当的GPU上运行推理"""
-        # 选择合适的GPU
-        target_device = select_gpu_for_operation()
-        print(f"Running inference on device: {target_device}")
+        # 存储初始化时的设备
+        self._init_device = self._devices[0]  # GPU 0 用于初始化和其他操作
+        self._inference_device = self._devices[1]  # GPU 1 专门用于推理
         
-        # 在选定的设备上运行推理
-        with jax.default_device(target_device):
-            # 创建一个新的模型实例在目标设备上
-            temp_model_runner = ModelRunner(
+        print(f"Initialized model on {self._init_device}")
+        print(f"Will use {self._inference_device} for inference")
+    
+    def run_inference(self, featurised_example: features.BatchDict, rng_key: jnp.ndarray) -> model.ModelResult:
+        """在GPU 1上运行推理"""
+        print(f"Running inference on {self._inference_device}")
+        
+        # 在GPU 1上运行推理
+        with jax.default_device(self._inference_device):
+            # 创建一个新的模型实例在GPU 1上
+            inference_model_runner = ModelRunner(
                 config=self._model_config,
-                device=target_device,
+                device=self._inference_device,
                 model_dir=self._model_dir
             )
             
-            # 只移动数值类型的数据到GPU
+            # 只移动数值类型的数据到GPU 1
             def move_to_device(x):
                 try:
                     if isinstance(x, (np.ndarray, jnp.ndarray)) and np.issubdtype(x.dtype, np.number):
-                        return jax.device_put(x, target_device)
+                        return jax.device_put(x, self._inference_device)
                     return x
                 except Exception as e:
                     print(f"Warning: Failed to move data to device: {str(e)}")
@@ -788,24 +793,23 @@ class DynamicGPUModelRunner(ModelRunner):
             
             # 递归处理输入数据
             featurised_example = jax.tree_util.tree_map(move_to_device, featurised_example)
-            rng_key = jax.device_put(rng_key, target_device)
+            rng_key = jax.device_put(rng_key, self._inference_device)
             
-            # 运行推理
-            result = temp_model_runner.run_inference(featurised_example, rng_key)
+            # 在GPU 1上运行推理
+            result = inference_model_runner.run_inference(featurised_example, rng_key)
             
-            # 如果使用的是GPU 1，确保数据返回到CPU
-            if target_device == self._devices[1]:
-                def move_to_cpu(x):
-                    try:
-                        if isinstance(x, (np.ndarray, jnp.ndarray)):
-                            return np.array(x)
-                        return x
-                    except Exception as e:
-                        print(f"Warning: Failed to move data to CPU: {str(e)}")
-                        return x
-                
-                result = jax.tree_util.tree_map(move_to_cpu, result)
-                print(f"Data transferred back from {target_device} to CPU")
+            # 将结果移回CPU，以便后续在GPU 0上处理
+            def move_to_cpu(x):
+                try:
+                    if isinstance(x, (np.ndarray, jnp.ndarray)):
+                        return np.array(x)
+                    return x
+                except Exception as e:
+                    print(f"Warning: Failed to move data to CPU: {str(e)}")
+                    return x
+            
+            result = jax.tree_util.tree_map(move_to_cpu, result)
+            print(f"Inference completed on {self._inference_device}, data transferred to CPU")
         
         return result
 
