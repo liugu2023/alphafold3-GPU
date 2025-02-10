@@ -730,6 +730,72 @@ def get_gpu_mapping():
         return {i: visible_gpus[i] for i in range(len(visible_gpus))}
     return None
 
+def get_gpu_utilization(gpu_id: int) -> float:
+    """获取指定GPU的使用率"""
+    try:
+        gpu = GPUtil.getGPUs()[gpu_id]
+        return gpu.memoryUtil * 100  # 转换为百分比
+    except Exception:
+        return 0
+
+def select_gpu_for_operation() -> int:
+    """根据GPU使用情况选择合适的GPU
+    
+    Returns:
+        int: 选择的GPU ID (0或1)
+    """
+    gpu0_util = get_gpu_utilization(_MAIN_GPU.value)
+    gpu1_util = get_gpu_utilization(_WORKER_GPU.value)
+    
+    print(f"Current GPU utilization - GPU {_MAIN_GPU.value}: {gpu0_util:.1f}%, GPU {_WORKER_GPU.value}: {gpu1_util:.1f}%")
+    
+    # 如果主GPU使用率超过80%，且备用GPU使用率较低，则使用备用GPU
+    if gpu0_util > 80 and gpu1_util < gpu0_util:
+        print(f"Switching to GPU {_WORKER_GPU.value} for next operation")
+        return _WORKER_GPU.value
+    return _MAIN_GPU.value
+
+class DynamicGPUModelRunner(ModelRunner):
+    """支持动态GPU切换的ModelRunner"""
+    
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._main_gpu = _MAIN_GPU.value
+        self._worker_gpu = _WORKER_GPU.value
+        
+    def run_inference(self, featurised_example: features.BatchDict, rng_key: jnp.ndarray) -> model.ModelResult:
+        """在适当的GPU上运行推理"""
+        # 选择合适的GPU
+        selected_gpu = select_gpu_for_operation()
+        
+        if selected_gpu != self._main_gpu:
+            print(f"Running inference on GPU {selected_gpu}")
+            # 临时切换到选定的GPU
+            original_devices = os.environ.get('CUDA_VISIBLE_DEVICES')
+            os.environ['CUDA_VISIBLE_DEVICES'] = str(selected_gpu)
+            
+            # 重新初始化设备
+            devices = jax.local_devices(backend='gpu')
+            if not devices:
+                raise RuntimeError(f"Failed to initialize GPU {selected_gpu}")
+            
+            # 在选定的GPU上运行推理
+            result = super().run_inference(featurised_example, rng_key)
+            
+            # 恢复原始GPU设置
+            if original_devices is not None:
+                os.environ['CUDA_VISIBLE_DEVICES'] = original_devices
+            
+            # 确保数据返回到CPU内存
+            result = jax.tree.map(lambda x: np.array(x), result)
+            
+            print(f"Inference completed on GPU {selected_gpu}, data transferred back to CPU")
+        else:
+            # 在主GPU上运行
+            result = super().run_inference(featurised_example, rng_key)
+        
+        return result
+
 def main(_):
     # 在最开始就设置主进程只使用 GPU 0
     os.environ['CUDA_VISIBLE_DEVICES'] = str(_MAIN_GPU.value)
@@ -854,8 +920,7 @@ def main(_):
                 raise RuntimeError("No GPU devices found")
             
             print(f'Found local devices: {devices}')
-            print(f'Main process using GPU {_MAIN_GPU.value}')
-            print(f'Worker processes will use GPU {_WORKER_GPU.value}')
+            print(f'Main GPU: {_MAIN_GPU.value}, Worker GPU: {_WORKER_GPU.value}')
             
             # 检查模型目录
             model_path = pathlib.Path(MODEL_DIR.value)
@@ -863,117 +928,44 @@ def main(_):
                 raise FileNotFoundError(f"Model directory not found: {model_path}")
             print(f"Using model directory: {model_path}")
             
-            total_inputs = len(fold_input_list)
-            print(f"Processing {total_inputs} inputs...")
+            # 使用动态GPU ModelRunner
+            print('Building model from scratch...')
+            model_runner = DynamicGPUModelRunner(
+                config=make_model_config(
+                    flash_attention_implementation=typing.cast(
+                        attention.Implementation, _FLASH_ATTENTION_IMPLEMENTATION.value
+                    ),
+                    num_diffusion_samples=_NUM_DIFFUSION_SAMPLES.value,
+                    num_recycles=_NUM_RECYCLES.value,
+                    return_embeddings=_SAVE_EMBEDDINGS.value,
+                ),
+                device=devices[0],
+                model_dir=pathlib.Path(MODEL_DIR.value),
+            )
             
-            if total_inputs > 500:
+            print('Checking that model parameters can be loaded...')
+            _ = model_runner.model_params
+            print('Model parameters loaded successfully')
+            
+            # 处理输入
+            num_fold_inputs = 0
+            for fold_input in fold_input_list:
                 try:
-                    max_workers = min(psutil.cpu_count(logical=False), 8)
-                    
-                    # 临时恢复环境变量来检查 GPU 1
-                    original_visible_devices = os.environ.get('CUDA_VISIBLE_DEVICES')
-                    os.environ['CUDA_VISIBLE_DEVICES'] = '0,1'
-                    available_memory = get_available_gpu_memory(_WORKER_GPU.value)
-                    
-                    # 恢复主进程的 GPU 设置
-                    if original_visible_devices is not None:
-                        os.environ['CUDA_VISIBLE_DEVICES'] = original_visible_devices
-                    else:
-                        os.environ['CUDA_VISIBLE_DEVICES'] = str(_MAIN_GPU.value)
-                    
-                    batch_size = estimate_batch_size(available_memory)
-                    print(f"Available GPU memory on worker GPU: {available_memory:.2f}GB")
-                    print(f"Estimated batch size: {batch_size}")
-                    print(f"Number of workers: {max_workers}")
-                    
-                    # 将输入分成批次
-                    batches = [
-                        fold_input_list[i:i + batch_size]
-                        for i in range(0, total_inputs, batch_size)
-                    ]
-                    print(f"Split {total_inputs} inputs into {len(batches)} batches")
-                    
-                    # 使用multiprocessing.Pool而不是ProcessPoolExecutor
-                    with multiprocessing.Pool(
-                        processes=max_workers,
-                        initializer=lambda: os.environ.update({'CUDA_VISIBLE_DEVICES': str(_WORKER_GPU.value)})
-                    ) as pool:
-                        futures = []
-                        for i, batch in enumerate(batches):
-                            print(f"Submitting batch {i+1}/{len(batches)} with {len(batch)} inputs")
-                            future = pool.apply_async(
-                                process_batch,
-                                kwds={
-                                    'fold_inputs': batch,
-                                    'data_pipeline_config': data_pipeline_config,
-                                    'model_dir': MODEL_DIR.value,
-                                    'output_dir': _OUTPUT_DIR.value,
-                                    'main_gpu': _MAIN_GPU.value,
-                                    'worker_gpu': _WORKER_GPU.value,
-                                    'buckets': tuple(int(bucket) for bucket in _BUCKETS.value),
-                                    'flash_attention_implementation': _FLASH_ATTENTION_IMPLEMENTATION.value,
-                                    'num_diffusion_samples': _NUM_DIFFUSION_SAMPLES.value,
-                                    'num_recycles': _NUM_RECYCLES.value,
-                                    'save_embeddings': _SAVE_EMBEDDINGS.value,
-                                    'conformer_max_iterations': _CONFORMER_MAX_ITERATIONS.value,
-                                }
-                            )
-                            futures.append((i, future))
-                        
-                        # 等待并检查每个批次的结果
-                        for i, future in futures:
-                            try:
-                                future.get()  # 这会抛出子进程中的任何异常
-                                print(f"Batch {i+1}/{len(batches)} completed successfully")
-                            except Exception as e:
-                                print(f"Error processing batch {i+1}: {str(e)}")
-                                raise
-                
-                except Exception as e:
-                    print(f"Error in multi-process execution: {str(e)}")
-                    raise
-            else:
-                # 单进程处理逻辑
-                try:
-                    print('Building model from scratch...')
-                    model_runner = ModelRunner(
-                        config=make_model_config(
-                            flash_attention_implementation=typing.cast(
-                                attention.Implementation, _FLASH_ATTENTION_IMPLEMENTATION.value
-                            ),
-                            num_diffusion_samples=_NUM_DIFFUSION_SAMPLES.value,
-                            num_recycles=_NUM_RECYCLES.value,
-                            return_embeddings=_SAVE_EMBEDDINGS.value,
-                        ),
-                        device=devices[0],  # 由于设置了CUDA_VISIBLE_DEVICES，使用0即可
-                        model_dir=pathlib.Path(MODEL_DIR.value),
+                    if _NUM_SEEDS.value is not None:
+                        print(f'Expanding fold job {fold_input.name} to {_NUM_SEEDS.value} seeds')
+                        fold_input = fold_input.with_multiple_seeds(_NUM_SEEDS.value)
+                    process_fold_input(
+                        fold_input=fold_input,
+                        data_pipeline_config=data_pipeline_config,
+                        model_runner=model_runner,
+                        output_dir=os.path.join(_OUTPUT_DIR.value, fold_input.sanitised_name()),
+                        buckets=tuple(int(bucket) for bucket in _BUCKETS.value),
+                        conformer_max_iterations=_CONFORMER_MAX_ITERATIONS.value,
                     )
-                    print('Checking that model parameters can be loaded...')
-                    _ = model_runner.model_params
-                    print('Model parameters loaded successfully')
-                    
-                    num_fold_inputs = 0
-                    for fold_input in fold_input_list:
-                        try:
-                            if _NUM_SEEDS.value is not None:
-                                print(f'Expanding fold job {fold_input.name} to {_NUM_SEEDS.value} seeds')
-                                fold_input = fold_input.with_multiple_seeds(_NUM_SEEDS.value)
-                            process_fold_input(
-                                fold_input=fold_input,
-                                data_pipeline_config=data_pipeline_config,
-                                model_runner=model_runner,
-                                output_dir=os.path.join(_OUTPUT_DIR.value, fold_input.sanitised_name()),
-                                buckets=tuple(int(bucket) for bucket in _BUCKETS.value),
-                                conformer_max_iterations=_CONFORMER_MAX_ITERATIONS.value,
-                            )
-                            num_fold_inputs += 1
-                            print(f"Processed {num_fold_inputs}/{len(fold_input_list)} inputs")
-                        except Exception as e:
-                            print(f"Error processing input {fold_input.name}: {str(e)}")
-                            raise
-                
+                    num_fold_inputs += 1
+                    print(f"Processed {num_fold_inputs}/{len(fold_input_list)} inputs")
                 except Exception as e:
-                    print(f"Error in single-process execution: {str(e)}")
+                    print(f"Error processing input {fold_input.name}: {str(e)}")
                     raise
 
         except Exception as e:
