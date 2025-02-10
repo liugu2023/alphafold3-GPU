@@ -873,7 +873,7 @@ def run_inference_process(
             'XLA_FORCE_HOST_PLATFORM_DEVICE_COUNT': '1',
             'TF_FORCE_GPU_ALLOW_GROWTH': 'false',
             'XLA_PYTHON_CLIENT_MEM_LIMIT_MB': '14000',
-            'XLA_PYTHON_CLIENT_DEVICE_PRIORITY': '0',  # 强制使用第一个可见设备
+            'XLA_PYTHON_CLIENT_DEVICE_PRIORITY': '0',
         })
         
         # 6. 重新初始化JAX
@@ -881,13 +881,18 @@ def run_inference_process(
         importlib.reload(jax.lib)
         importlib.reload(jax)
         
-        # 7. 验证JAX设备
+        # 7. 验证JAX设备并再次检查显存
         devices = jax.devices('gpu')
         if not devices:
             raise RuntimeError("No GPU devices found")
         print(f"JAX initialized with devices: {devices}")
-        print(f"Current CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES')}")
-        print(f"Current JAX backend: {jax.default_backend()}")
+        
+        used, total = get_gpu_memory_info(target_gpu)
+        free = total - used
+        print(f"GPU {target_gpu} memory after JAX init: {used:.1f}GB/{total:.1f}GB (Free: {free:.1f}GB)")
+        
+        if free < MIN_REQUIRED_MEMORY:
+            raise RuntimeError(f"Insufficient GPU memory after JAX initialization: only {free:.1f}GB available")
         
         # 8. 创建模型实例
         with jax.default_device(devices[0]):
@@ -898,10 +903,20 @@ def run_inference_process(
             )
             print("Successfully created model runner")
             
+            # 检查模型加载后的显存
+            used, total = get_gpu_memory_info(target_gpu)
+            free = total - used
+            print(f"GPU {target_gpu} memory after model creation: {used:.1f}GB/{total:.1f}GB (Free: {free:.1f}GB)")
+            
             # 9. 运行推理
             print("Starting inference...")
             result = inference_model.run_inference(featurised_example, rng_key)
             print("Inference completed successfully")
+            
+            # 检查推理后的显存
+            used, total = get_gpu_memory_info(target_gpu)
+            free = total - used
+            print(f"GPU {target_gpu} memory after inference: {used:.1f}GB/{total:.1f}GB (Free: {free:.1f}GB)")
         
         # 10. 确保结果在CPU上
         result = jax.tree_util.tree_map(
