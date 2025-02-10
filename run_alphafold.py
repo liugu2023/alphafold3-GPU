@@ -804,13 +804,22 @@ def select_gpu_for_inference(main_gpu: int, worker_gpu: int) -> int:
     gpu0_used, gpu0_total = get_gpu_memory_info(main_gpu)
     gpu1_used, gpu1_total = get_gpu_memory_info(worker_gpu)
     
-    gpu0_usage = gpu0_used / gpu0_total if gpu0_total > 0 else 1
-    gpu1_usage = gpu1_used / gpu1_total if gpu1_total > 0 else 1
+    # 计算可用显存而不是使用率
+    gpu0_free = gpu0_total - gpu0_used
+    gpu1_free = gpu1_total - gpu1_used
     
-    print(f"GPU {main_gpu} memory: {gpu0_used:.1f}GB/{gpu0_total:.1f}GB ({gpu0_usage*100:.1f}%)")
-    print(f"GPU {worker_gpu} memory: {gpu1_used:.1f}GB/{gpu1_total:.1f}GB ({gpu1_usage*100:.1f}%)")
+    print(f"GPU {main_gpu} memory: {gpu0_used:.1f}GB/{gpu0_total:.1f}GB (Free: {gpu0_free:.1f}GB)")
+    print(f"GPU {worker_gpu} memory: {gpu1_used:.1f}GB/{gpu1_total:.1f}GB (Free: {gpu1_free:.1f}GB)")
     
-    return worker_gpu if gpu1_usage < gpu0_usage else main_gpu
+    # 需要至少8GB可用显存
+    MIN_REQUIRED_MEMORY = 8
+    
+    if gpu0_free >= MIN_REQUIRED_MEMORY and gpu0_free > gpu1_free:
+        return main_gpu
+    elif gpu1_free >= MIN_REQUIRED_MEMORY:
+        return worker_gpu
+    else:
+        raise RuntimeError(f"No GPU has enough free memory (need at least {MIN_REQUIRED_MEMORY}GB)")
 
 def run_inference_process(
     featurised_example: features.BatchDict,
@@ -823,22 +832,28 @@ def run_inference_process(
 ) -> model.ModelResult:
     """在显存占用较低的GPU上运行推理"""
     # 选择显存占用较低的GPU
-    target_gpu = select_gpu_for_inference(main_gpu, worker_gpu)
-    print(f"Selected GPU {target_gpu} for inference")
-    
-    # 设置环境变量
-    os.environ['CUDA_VISIBLE_DEVICES'] = str(target_gpu)
-    torch.cuda.set_device(0)
-    
-    # 设置JAX配置
-    os.environ.update({
-        'XLA_PYTHON_CLIENT_MEM_FRACTION': '0.7',
-        'XLA_PYTHON_CLIENT_PREALLOCATE': 'false',
-        'XLA_PYTHON_CLIENT_ALLOCATOR': 'platform'
-    })
-    
-    # 创建模型实例
     try:
+        target_gpu = select_gpu_for_inference(main_gpu, worker_gpu)
+        print(f"Selected GPU {target_gpu} for inference")
+        
+        # 设置环境变量
+        os.environ['CUDA_VISIBLE_DEVICES'] = str(target_gpu)
+        torch.cuda.set_device(0)
+        
+        # 设置JAX配置 - 增加显存限制
+        os.environ.update({
+            'XLA_PYTHON_CLIENT_MEM_FRACTION': '0.95',  # 允许使用更多显存
+            'XLA_PYTHON_CLIENT_PREALLOCATE': 'false',
+            'XLA_PYTHON_CLIENT_ALLOCATOR': 'platform',
+            'XLA_PYTHON_CLIENT_MEM_LIMIT_MB': '14000',  # 限制最大显存使用
+            'XLA_GPU_STRICT_CONV_ALGORITHM': 'true'  # 使用较少显存的卷积算法
+        })
+        
+        # 清理显存
+        torch.cuda.empty_cache()
+        jax.clear_caches()
+        
+        # 创建模型实例
         devices = jax.devices('gpu')
         if not devices:
             raise RuntimeError("No GPU devices found")
@@ -852,22 +867,27 @@ def run_inference_process(
         
         # 运行推理前再次检查显存
         used, total = get_gpu_memory_info(target_gpu)
-        print(f"GPU {target_gpu} memory before inference: {used:.1f}GB/{total:.1f}GB")
+        free = total - used
+        print(f"GPU {target_gpu} memory before inference: Used={used:.1f}GB, Free={free:.1f}GB")
+        
+        if free < 8:  # 如果可用显存小于8GB，抛出错误
+            raise RuntimeError(f"Insufficient GPU memory: only {free:.1f}GB available")
         
         # 运行推理
         print("Starting inference...")
         result = inference_model.run_inference(featurised_example, rng_key)
         print("Inference completed successfully")
         
-        # 推理后检查显存
-        used, total = get_gpu_memory_info(target_gpu)
-        print(f"GPU {target_gpu} memory after inference: {used:.1f}GB/{total:.1f}GB")
-        
-        # 确保结果在CPU上
+        # 确保结果在CPU上并清理GPU显存
         result = jax.tree_util.tree_map(
             lambda x: np.array(x) if isinstance(x, (np.ndarray, jnp.ndarray)) else x,
             result
         )
+        
+        # 清理显存
+        del inference_model
+        torch.cuda.empty_cache()
+        jax.clear_caches()
         
         return result
         
