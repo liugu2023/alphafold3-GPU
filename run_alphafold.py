@@ -920,10 +920,15 @@ def run_inference_process(
     rng_key: jnp.ndarray,
     model_config: model.Model.Config,
     model_dir: pathlib.Path,
-    gpu_id: int,  # 只需要一个GPU ID
+    gpu_id: int,
 ) -> model.ModelResult:
     """在指定GPU上运行推理"""
     try:
+        print("\n=== Inference Process Device Information ===")
+        print(f"Requested GPU ID: {gpu_id}")
+        print(f"Initial CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES', 'Not set')}")
+        print(f"Initial JAX devices: {jax.devices()}")
+        
         # 1. 设置环境变量
         os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
         os.environ.update({
@@ -941,12 +946,26 @@ def run_inference_process(
         importlib.reload(jax.lib)
         importlib.reload(jax)
         
-        # 3. 验证JAX设备
+        # 3. 验证JAX设备并输出详细信息
+        print("\n=== JAX Configuration After Initialization ===")
+        print(f"CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES', 'Not set')}")
+        print(f"JAX backend: {jax.default_backend()}")
+        print(f"All JAX devices: {jax.devices()}")
+        print(f"Default JAX device: {jax.default_device()}")
+        
         devices = jax.devices('gpu')
         if not devices:
             raise RuntimeError("No GPU devices found")
+        
+        print("\n=== Available GPU Devices to JAX ===")
+        for device in devices:
+            print(f"  - Device: {device}")
+            print(f"    Platform: {device.platform}")
+            print(f"    Device kind: {device.device_kind}")
+            print(f"    Device ID: {device.id}")
             
         # 4. 创建模型实例并运行推理
+        print(f"\n=== Creating Model on Device {devices[0]} ===")
         with jax.default_device(devices[0]):
             inference_model = ModelRunner(
                 config=model_config,
@@ -964,7 +983,11 @@ def run_inference_process(
         return result
         
     except Exception as e:
-        print(f"Error in inference process: {str(e)}")
+        print(f"\n=== Error in Inference Process ===")
+        print(f"Error message: {str(e)}")
+        print(f"Current CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES', 'Not set')}")
+        print(f"Current JAX devices: {jax.devices()}")
+        print(f"Current JAX backend: {jax.default_backend()}")
         raise
 
 def main(_):
