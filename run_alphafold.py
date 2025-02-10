@@ -849,18 +849,26 @@ def run_inference_process(
         print(f"GPU {main_gpu}: {gpu0_used:.1f}GB/{gpu0_total:.1f}GB (Free: {gpu0_free:.1f}GB)")
         print(f"GPU {worker_gpu}: {gpu1_used:.1f}GB/{gpu1_total:.1f}GB (Free: {gpu1_free:.1f}GB)")
         
-        # 2. 选择显存较多的GPU
+        # 2. 检查是否有足够显存
+        MIN_REQUIRED_MEMORY = 8.0
+        if max(gpu0_free, gpu1_free) < MIN_REQUIRED_MEMORY:
+            raise RuntimeError(
+                f"No GPU has enough free memory before JAX initialization (need at least {MIN_REQUIRED_MEMORY}GB). "
+                f"GPU {main_gpu}: {gpu0_free:.1f}GB free, GPU {worker_gpu}: {gpu1_free:.1f}GB free"
+            )
+        
+        # 3. 选择显存较多的GPU
         target_gpu = main_gpu if gpu0_free > gpu1_free else worker_gpu
         print(f"Selected GPU {target_gpu} with {max(gpu0_free, gpu1_free):.1f}GB free memory")
         
-        # 3. 重要：在设置环境变量之前清除 JAX 的设备缓存
+        # 4. 重要：在设置环境变量之前清除 JAX 的设备缓存
         jax.clear_caches()
         jax.lib.xla_bridge.get_backend.cache_clear()
         
-        # 4. 设置环境变量
+        # 5. 设置环境变量
         os.environ['CUDA_VISIBLE_DEVICES'] = str(target_gpu)
         
-        # 5. 设置 JAX 配置
+        # 6. 设置 JAX 配置
         os.environ.update({
             'XLA_PYTHON_CLIENT_MEM_FRACTION': '0.95',
             'XLA_PYTHON_CLIENT_PREALLOCATE': 'true',
@@ -870,17 +878,17 @@ def run_inference_process(
             'XLA_PYTHON_CLIENT_MEM_LIMIT_MB': '14000',
         })
         
-        # 6. 重新初始化 JAX
+        # 7. 重新初始化 JAX
         import importlib
         importlib.reload(jax)
         
-        # 7. 验证 JAX 设备
+        # 8. 验证 JAX 设备
         devices = jax.devices('gpu')
         if not devices:
             raise RuntimeError("No GPU devices found")
         print(f"Available JAX devices: {devices}")
         
-        # 8. 创建模型实例
+        # 9. 创建模型实例
         with jax.default_device(devices[0]):
             inference_model = ModelRunner(
                 config=model_config,
@@ -889,12 +897,22 @@ def run_inference_process(
             )
             print("Successfully created model runner")
             
-            # 9. 运行推理
+            # 10. 再次检查显存状态
+            used, total = get_gpu_memory_info(target_gpu)
+            free = total - used
+            print(f"GPU {target_gpu} memory after model creation: {used:.1f}GB/{total:.1f}GB (Free: {free:.1f}GB)")
+            
+            # 11. 运行推理
             print("Starting inference...")
             result = inference_model.run_inference(featurised_example, rng_key)
             print("Inference completed successfully")
+            
+            # 12. 最终显存状态
+            used, total = get_gpu_memory_info(target_gpu)
+            free = total - used
+            print(f"GPU {target_gpu} memory after inference: {used:.1f}GB/{total:.1f}GB (Free: {free:.1f}GB)")
         
-        # 10. 确保结果在CPU上
+        # 13. 确保结果在CPU上
         result = jax.tree_util.tree_map(
             lambda x: np.array(x) if isinstance(x, (np.ndarray, jnp.ndarray)) else x,
             result
