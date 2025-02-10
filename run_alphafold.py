@@ -732,14 +732,23 @@ def main(_):
     fold_inputs = folding_input.load_fold_inputs_from_dir(
         pathlib.Path(_INPUT_DIR.value)
     )
+    print(f"Found {len(list(fold_inputs))} input files in {_INPUT_DIR.value}")
   elif _JSON_PATH.value is not None:
     fold_inputs = folding_input.load_fold_inputs_from_path(
         pathlib.Path(_JSON_PATH.value)
     )
+    print(f"Loading input from {_JSON_PATH.value}")
   else:
     raise AssertionError(
         'Exactly one of --json_path or --input_dir must be specified.'
     )
+
+  # 验证输入文件是否为空
+  fold_input_list = list(fold_inputs)
+  if not fold_input_list:
+    raise ValueError(f"No valid input files found in the specified location")
+  
+  print(f"Total number of inputs to process: {len(fold_input_list)}")
 
   # Make sure we can create the output directory before running anything.
   try:
@@ -817,93 +826,123 @@ def main(_):
     data_pipeline_config = None
 
   if _RUN_INFERENCE.value:
-    devices = jax.local_devices(backend='gpu')
-    print(
-        f'Found local devices: {devices}, using device {_GPU_DEVICE.value}:'
-        f' {devices[_GPU_DEVICE.value]}'
-    )
-
-    fold_input_list = list(fold_inputs)
-    total_inputs = len(fold_input_list)
-    
-    if total_inputs > 500:  # 当输入文件数量大于500时启用多进程
-        print(f'Processing {total_inputs} inputs using multiple processes...')
+    try:
+      devices = jax.local_devices(backend='gpu')
+      if not devices:
+        raise RuntimeError("No GPU devices found")
         
-        # 获取CPU核心数作为最大进程数
-        max_workers = min(psutil.cpu_count(logical=False), 8)
-        
-        # 获取可用显存
-        available_memory = get_available_gpu_memory()
-        batch_size = estimate_batch_size(available_memory)
-        
-        # 将输入分成多个批次
-        batches = [
-            fold_input_list[i:i + batch_size]
-            for i in range(0, len(fold_input_list), batch_size)
-        ]
-        
-        print(f'Split inputs into {len(batches)} batches, {batch_size} inputs per batch')
-        
-        with ProcessPoolExecutor(max_workers=max_workers) as executor:
+      print(f'Found local devices: {devices}, using device {_GPU_DEVICE.value}:'
+            f' {devices[_GPU_DEVICE.value]}')
+      
+      # 检查模型目录
+      model_path = pathlib.Path(MODEL_DIR.value)
+      if not model_path.exists():
+        raise FileNotFoundError(f"Model directory not found: {model_path}")
+      print(f"Using model directory: {model_path}")
+      
+      total_inputs = len(fold_input_list)
+      print(f"Processing {total_inputs} inputs...")
+      
+      if total_inputs > 500:
+        # 多进程处理逻辑
+        try:
+          max_workers = min(psutil.cpu_count(logical=False), 8)
+          available_memory = get_available_gpu_memory()
+          batch_size = estimate_batch_size(available_memory)
+          
+          print(f"Available GPU memory: {available_memory:.2f}GB")
+          print(f"Estimated batch size: {batch_size}")
+          print(f"Number of workers: {max_workers}")
+          
+          batches = [
+              fold_input_list[i:i + batch_size]
+              for i in range(0, total_inputs, batch_size)
+          ]
+          
+          print(f'Split inputs into {len(batches)} batches')
+          
+          with ProcessPoolExecutor(max_workers=max_workers) as executor:
             futures = []
-            for batch in batches:
-                futures.append(
-                    executor.submit(
-                        process_batch,
-                        fold_inputs=batch,
-                        data_pipeline_config=data_pipeline_config,
-                        model_dir=MODEL_DIR.value,
-                        output_dir=_OUTPUT_DIR.value,
-                        gpu_device=_GPU_DEVICE.value,
-                        buckets=tuple(int(bucket) for bucket in _BUCKETS.value),
-                        flash_attention_implementation=_FLASH_ATTENTION_IMPLEMENTATION.value,
-                        num_diffusion_samples=_NUM_DIFFUSION_SAMPLES.value,
-                        num_recycles=_NUM_RECYCLES.value,
-                        save_embeddings=_SAVE_EMBEDDINGS.value,
-                        conformer_max_iterations=_CONFORMER_MAX_ITERATIONS.value,
-                    )
-                )
+            for i, batch in enumerate(batches):
+              print(f"Submitting batch {i+1}/{len(batches)} with {len(batch)} inputs")
+              futures.append(
+                  executor.submit(
+                      process_batch,
+                      fold_inputs=batch,
+                      data_pipeline_config=data_pipeline_config,
+                      model_dir=MODEL_DIR.value,
+                      output_dir=_OUTPUT_DIR.value,
+                      gpu_device=_GPU_DEVICE.value,
+                      buckets=tuple(int(bucket) for bucket in _BUCKETS.value),
+                      flash_attention_implementation=_FLASH_ATTENTION_IMPLEMENTATION.value,
+                      num_diffusion_samples=_NUM_DIFFUSION_SAMPLES.value,
+                      num_recycles=_NUM_RECYCLES.value,
+                      save_embeddings=_SAVE_EMBEDDINGS.value,
+                      conformer_max_iterations=_CONFORMER_MAX_ITERATIONS.value,
+                  )
+              )
             
-            # 等待所有批次完成
-            for future in futures:
+            # 等待并检查每个批次的结果
+            for i, future in enumerate(futures):
+              try:
                 future.result()
-    else:
-        # 原有的单进程处理逻辑
-        if _RUN_INFERENCE.value:
-            print('Building model from scratch...')
-            model_runner = ModelRunner(
-                config=make_model_config(
-                    flash_attention_implementation=typing.cast(
-                        attention.Implementation, _FLASH_ATTENTION_IMPLEMENTATION.value
-                    ),
-                    num_diffusion_samples=_NUM_DIFFUSION_SAMPLES.value,
-                    num_recycles=_NUM_RECYCLES.value,
-                    return_embeddings=_SAVE_EMBEDDINGS.value,
-                ),
-                device=devices[_GPU_DEVICE.value],
-                model_dir=pathlib.Path(MODEL_DIR.value),
-            )
-            print('Checking that model parameters can be loaded...')
-            _ = model_runner.model_params
-        else:
-            model_runner = None
-
-        num_fold_inputs = 0
-        for fold_input in fold_inputs:
-            if _NUM_SEEDS.value is not None:
+                print(f"Batch {i+1}/{len(batches)} completed successfully")
+              except Exception as e:
+                print(f"Error processing batch {i+1}: {str(e)}")
+                raise
+        
+        except Exception as e:
+          print(f"Error in multi-process execution: {str(e)}")
+          raise
+      else:
+        # 单进程处理逻辑
+        try:
+          print('Building model from scratch...')
+          model_runner = ModelRunner(
+              config=make_model_config(
+                  flash_attention_implementation=typing.cast(
+                      attention.Implementation, _FLASH_ATTENTION_IMPLEMENTATION.value
+                  ),
+                  num_diffusion_samples=_NUM_DIFFUSION_SAMPLES.value,
+                  num_recycles=_NUM_RECYCLES.value,
+                  return_embeddings=_SAVE_EMBEDDINGS.value,
+              ),
+              device=devices[_GPU_DEVICE.value],
+              model_dir=pathlib.Path(MODEL_DIR.value),
+          )
+          print('Checking that model parameters can be loaded...')
+          _ = model_runner.model_params
+          print('Model parameters loaded successfully')
+          
+          num_fold_inputs = 0
+          for fold_input in fold_input_list:
+            try:
+              if _NUM_SEEDS.value is not None:
                 print(f'Expanding fold job {fold_input.name} to {_NUM_SEEDS.value} seeds')
                 fold_input = fold_input.with_multiple_seeds(_NUM_SEEDS.value)
-            process_fold_input(
-                fold_input=fold_input,
-                data_pipeline_config=data_pipeline_config,
-                model_runner=model_runner,
-                output_dir=os.path.join(_OUTPUT_DIR.value, fold_input.sanitised_name()),
-                buckets=tuple(int(bucket) for bucket in _BUCKETS.value),
-                conformer_max_iterations=_CONFORMER_MAX_ITERATIONS.value,
-            )
-            num_fold_inputs += 1
+              process_fold_input(
+                  fold_input=fold_input,
+                  data_pipeline_config=data_pipeline_config,
+                  model_runner=model_runner,
+                  output_dir=os.path.join(_OUTPUT_DIR.value, fold_input.sanitised_name()),
+                  buckets=tuple(int(bucket) for bucket in _BUCKETS.value),
+                  conformer_max_iterations=_CONFORMER_MAX_ITERATIONS.value,
+              )
+              num_fold_inputs += 1
+              print(f"Processed {num_fold_inputs}/{len(fold_input_list)} inputs")
+            except Exception as e:
+              print(f"Error processing input {fold_input.name}: {str(e)}")
+              raise
+            
+        except Exception as e:
+          print(f"Error in single-process execution: {str(e)}")
+          raise
 
-        print(f'Done running {num_fold_inputs} fold jobs.')
+    except Exception as e:
+      print(f"Fatal error during inference: {str(e)}")
+      raise
+
+  print(f'All jobs completed successfully')
 
 
 if __name__ == '__main__':
