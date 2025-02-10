@@ -410,22 +410,23 @@ def predict_structure_on_gpu(
     gpu_id: int,
     buckets: Sequence[int] | None = None,
     conformer_max_iterations: int | None = None,
+    is_worker_gpu: bool = False,  # 添加标志来区分是否是worker GPU
 ) -> Sequence[ResultsForSeed]:
     """在指定GPU上运行结构预测"""
     # 设置环境变量限制GPU使用
     os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
     
-    # GPU 1 的显存管理：禁用预分配，动态分配
-    if gpu_id == _WORKER_GPU.value:  # 如果是 GPU 1
+    # 根据是否是worker GPU设置不同的显存管理策略
+    if is_worker_gpu:  # 如果是 GPU 1
         os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
-        os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '0.95'  # 允许使用更多显存
+        os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '0.95'
         os.environ['XLA_PYTHON_CLIENT_ALLOCATOR'] = 'platform'
         os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'
     else:  # 如果是 GPU 0
         os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'true'
         os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '0.8'
         os.environ['XLA_PYTHON_CLIENT_ALLOCATOR'] = 'default'
-        
+    
     # 清理显存
     try:
         jax.clear_caches()
@@ -533,9 +534,10 @@ def predict_structure(
                 fold_input,
                 model_runner._model_config,
                 model_runner._model_dir,
-                _WORKER_GPU.value,
+                _WORKER_GPU.value,  # 直接传递GPU ID
                 buckets,
                 conformer_max_iterations,
+                True,  # 标记这是worker GPU
             )
         )
     return result
@@ -829,19 +831,20 @@ def run_inference_process(
     rng_key: jnp.ndarray,
     model_config: model.Model.Config,
     model_dir: pathlib.Path,
-    gpu_id: int
+    gpu_id: int,
+    is_worker_gpu: bool = False,  # 添加标志来区分是否是worker GPU
 ) -> model.ModelResult:
-    """在独立进程中运行推理
-    
-    Args:
-        featurised_example: 特征化的输入数据
-        rng_key: 随机数生成器密钥
-        model_config: 模型配置
-        model_dir: 模型目录
-        gpu_id: 要使用的GPU ID
-    """
-    # 设置进程使用指定的GPU
+    """在独立进程中运行推理"""
+    # 设置环境变量限制GPU使用
     os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
+    
+    # 根据是否是worker GPU设置不同的显存管理策略
+    if is_worker_gpu:
+        os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
+        os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '0.95'
+        os.environ['XLA_PYTHON_CLIENT_ALLOCATOR'] = 'platform'
+        os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'
+    
     print(f"Inference process starting on GPU {gpu_id}")
     
     # 初始化设备
@@ -883,8 +886,8 @@ class DynamicGPUModelRunner(ModelRunner):
         print(f"Starting inference process on GPU {self._worker_gpu}")
         
         # 使用multiprocessing启动推理进程
-        ctx = multiprocessing.get_context('spawn')  # 使用spawn方式创建进程
-        with ctx.Pool(1) as pool:  # 只创建一个进程
+        ctx = multiprocessing.get_context('spawn')
+        with ctx.Pool(1) as pool:
             result = pool.apply(
                 run_inference_process,
                 args=(
@@ -892,7 +895,8 @@ class DynamicGPUModelRunner(ModelRunner):
                     rng_key,
                     self._model_config,
                     self._model_dir,
-                    self._worker_gpu
+                    self._worker_gpu,
+                    True,  # 标记这是worker GPU
                 )
             )
         
