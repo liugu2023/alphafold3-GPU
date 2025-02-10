@@ -787,24 +787,17 @@ def get_gpu_memory_info(gpu_id: int) -> Tuple[float, float]:
     """
     try:
         gpu = GPUtil.getGPUs()[gpu_id]
-        return (gpu.memoryUsed/1024, gpu.memoryTotal/1024)
+        # GPUtil 返回的单位是MB，直接除以1024转换为GB
+        return (gpu.memoryUsed / 1024.0, gpu.memoryTotal / 1024.0)
     except Exception:
         return (0, 0)
 
 def select_gpu_for_inference(main_gpu: int, worker_gpu: int) -> int:
-    """选择显存占用率较低的GPU用于推理
-    
-    Args:
-        main_gpu: 主GPU ID
-        worker_gpu: 工作GPU ID
-    
-    Returns:
-        int: 选择的GPU ID
-    """
+    """选择显存占用率较低的GPU用于推理"""
     gpu0_used, gpu0_total = get_gpu_memory_info(main_gpu)
     gpu1_used, gpu1_total = get_gpu_memory_info(worker_gpu)
     
-    # 计算可用显存而不是使用率
+    # 计算可用显存
     gpu0_free = gpu0_total - gpu0_used
     gpu1_free = gpu1_total - gpu1_used
     
@@ -812,14 +805,19 @@ def select_gpu_for_inference(main_gpu: int, worker_gpu: int) -> int:
     print(f"GPU {worker_gpu} memory: {gpu1_used:.1f}GB/{gpu1_total:.1f}GB (Free: {gpu1_free:.1f}GB)")
     
     # 需要至少8GB可用显存
-    MIN_REQUIRED_MEMORY = 8
+    MIN_REQUIRED_MEMORY = 8.0  # 确保是浮点数
     
     if gpu0_free >= MIN_REQUIRED_MEMORY and gpu0_free > gpu1_free:
+        print(f"Selected GPU {main_gpu} with {gpu0_free:.1f}GB free memory")
         return main_gpu
     elif gpu1_free >= MIN_REQUIRED_MEMORY:
+        print(f"Selected GPU {worker_gpu} with {gpu1_free:.1f}GB free memory")
         return worker_gpu
     else:
-        raise RuntimeError(f"No GPU has enough free memory (need at least {MIN_REQUIRED_MEMORY}GB)")
+        raise RuntimeError(
+            f"No GPU has enough free memory (need at least {MIN_REQUIRED_MEMORY}GB). "
+            f"GPU {main_gpu}: {gpu0_free:.1f}GB free, GPU {worker_gpu}: {gpu1_free:.1f}GB free"
+        )
 
 def create_gpu_process(gpu_id: int) -> None:
     """在指定GPU上创建预留进程并预留少量显存
