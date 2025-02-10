@@ -768,6 +768,35 @@ def select_gpu_for_operation() -> jax.Device:
         return devices[1]
     return devices[0]
 
+def get_gpu_memory_info(gpu_id: int) -> Tuple[float, float]:
+    """获取指定GPU的显存使用情况
+    
+    Returns:
+        Tuple[float, float]: (已用显存GB, 总显存GB)
+    """
+    try:
+        gpu = GPUtil.getGPUs()[gpu_id]
+        return (gpu.memoryUsed/1024, gpu.memoryTotal/1024)
+    except Exception:
+        return (0, 0)
+
+def select_gpu_for_inference() -> int:
+    """选择显存占用率较低的GPU用于推理
+    
+    Returns:
+        int: 选择的GPU ID
+    """
+    gpu0_used, gpu0_total = get_gpu_memory_info(_MAIN_GPU.value)
+    gpu1_used, gpu1_total = get_gpu_memory_info(_WORKER_GPU.value)
+    
+    gpu0_usage = gpu0_used / gpu0_total if gpu0_total > 0 else 1
+    gpu1_usage = gpu1_used / gpu1_total if gpu1_total > 0 else 1
+    
+    print(f"GPU {_MAIN_GPU.value} memory: {gpu0_used:.1f}GB/{gpu0_total:.1f}GB ({gpu0_usage*100:.1f}%)")
+    print(f"GPU {_WORKER_GPU.value} memory: {gpu1_used:.1f}GB/{gpu1_total:.1f}GB ({gpu1_usage*100:.1f}%)")
+    
+    return _WORKER_GPU.value if gpu1_usage < gpu0_usage else _MAIN_GPU.value
+
 def run_inference_process(
     featurised_example: features.BatchDict,
     rng_key: jnp.ndarray,
@@ -776,18 +805,20 @@ def run_inference_process(
     gpu_id: int,
     is_worker_gpu: bool = False,
 ) -> model.ModelResult:
-    """在独立进程中运行推理，使用预留的显存"""
-    print(f"Inference process starting on GPU {gpu_id}")
+    """在显存占用较低的GPU上运行推理"""
+    # 选择显存占用较低的GPU
+    target_gpu = select_gpu_for_inference()
+    print(f"Selected GPU {target_gpu} for inference")
     
-    # 使用与预留显存相同的GPU上下文
-    os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
-    torch.cuda.set_device(0)  # 因为设置了CUDA_VISIBLE_DEVICES，所以这里用0
+    # 设置环境变量
+    os.environ['CUDA_VISIBLE_DEVICES'] = str(target_gpu)
+    torch.cuda.set_device(0)
     
-    # 设置JAX使用预留的显存区域
+    # 设置JAX配置
     os.environ.update({
-        'XLA_PYTHON_CLIENT_MEM_FRACTION': '0.7',  # 使用预留区域的显存
-        'XLA_PYTHON_CLIENT_PREALLOCATE': 'false',  # 禁用预分配，使用已预留的显存
-        'XLA_PYTHON_CLIENT_ALLOCATOR': 'platform'  # 使用平台原生分配器
+        'XLA_PYTHON_CLIENT_MEM_FRACTION': '0.7',
+        'XLA_PYTHON_CLIENT_PREALLOCATE': 'false',
+        'XLA_PYTHON_CLIENT_ALLOCATOR': 'platform'
     })
     
     # 创建模型实例
@@ -803,10 +834,18 @@ def run_inference_process(
         )
         print("Successfully created model runner")
         
+        # 运行推理前再次检查显存
+        used, total = get_gpu_memory_info(target_gpu)
+        print(f"GPU {target_gpu} memory before inference: {used:.1f}GB/{total:.1f}GB")
+        
         # 运行推理
         print("Starting inference...")
         result = inference_model.run_inference(featurised_example, rng_key)
         print("Inference completed successfully")
+        
+        # 推理后检查显存
+        used, total = get_gpu_memory_info(target_gpu)
+        print(f"GPU {target_gpu} memory after inference: {used:.1f}GB/{total:.1f}GB")
         
         # 确保结果在CPU上
         result = jax.tree_util.tree_map(
