@@ -415,12 +415,17 @@ def predict_structure_on_gpu(
     # 设置环境变量限制GPU使用
     os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
     
-    # 设置JAX显存管理参数
-    os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'  # 禁止预分配
-    os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '0.9'   # 最多使用90%显存
-    os.environ['XLA_PYTHON_CLIENT_ALLOCATOR'] = 'platform'  # 使用平台原生分配器
-    os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'       # 允许显存动态增长
-    
+    # GPU 1 的显存管理：禁用预分配，动态分配
+    if gpu_id == _WORKER_GPU.value:  # 如果是 GPU 1
+        os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
+        os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '0.95'  # 允许使用更多显存
+        os.environ['XLA_PYTHON_CLIENT_ALLOCATOR'] = 'platform'
+        os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'
+    else:  # 如果是 GPU 0
+        os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'true'
+        os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '0.8'
+        os.environ['XLA_PYTHON_CLIENT_ALLOCATOR'] = 'default'
+        
     # 清理显存
     try:
         jax.clear_caches()
@@ -430,6 +435,10 @@ def predict_structure_on_gpu(
     
     print(f"Structure prediction process running on GPU {gpu_id}")
     print(f"Available GPU memory before model creation: {get_available_gpu_memory(gpu_id):.2f}GB")
+    print(f"Memory management settings for GPU {gpu_id}:")
+    print(f"  PREALLOCATE: {os.environ.get('XLA_PYTHON_CLIENT_PREALLOCATE')}")
+    print(f"  MEM_FRACTION: {os.environ.get('XLA_PYTHON_CLIENT_MEM_FRACTION')}")
+    print(f"  ALLOCATOR: {os.environ.get('XLA_PYTHON_CLIENT_ALLOCATOR')}")
     
     # 初始化设备
     devices = jax.local_devices(backend='gpu')
@@ -861,8 +870,12 @@ class DynamicGPUModelRunner(ModelRunner):
         self._model_dir = kwargs['model_dir']
         self._worker_gpu = _WORKER_GPU.value
         
-        # 只在主GPU上初始化基础模型
+        # 主进程在 GPU 0 上使用预分配
         os.environ['CUDA_VISIBLE_DEVICES'] = str(_MAIN_GPU.value)
+        os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'true'
+        os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '0.8'
+        os.environ['XLA_PYTHON_CLIENT_ALLOCATOR'] = 'default'
+        
         super().__init__(*args, **kwargs)
         
     def run_inference(self, featurised_example: features.BatchDict, rng_key: jnp.ndarray) -> model.ModelResult:
@@ -887,12 +900,11 @@ class DynamicGPUModelRunner(ModelRunner):
         return result
 
 def main(_):
-    # 主进程只使用GPU 0
+    # 主进程使用 GPU 0，允许预分配显存以提高性能
     os.environ['CUDA_VISIBLE_DEVICES'] = str(_MAIN_GPU.value)
-    
-    # 设置XLA默认不预分配全部显存
-    os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
-    os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '0.5'
+    # GPU 0 的显存管理：允许预分配，但限制使用量
+    os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '0.8'  # 使用80%显存
+    os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'true'  # 允许预分配
     
     if _JAX_COMPILATION_CACHE_DIR.value is not None:
         jax.config.update(
