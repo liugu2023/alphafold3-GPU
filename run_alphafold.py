@@ -839,7 +839,10 @@ def run_inference_process(
 ) -> model.ModelResult:
     """在显存占用较低的GPU上运行推理"""
     try:
-        # 1. 在JAX初始化前检查显存状态
+        # 1. 首先设置环境变量让JAX能看到两个GPU
+        os.environ['CUDA_VISIBLE_DEVICES'] = f"{main_gpu},{worker_gpu}"
+        
+        # 2. 在JAX初始化前检查显存状态
         gpu0_used, gpu0_total = get_gpu_memory_info(main_gpu)
         gpu1_used, gpu1_total = get_gpu_memory_info(worker_gpu)
         gpu0_free = gpu0_total - gpu0_used
@@ -849,7 +852,7 @@ def run_inference_process(
         print(f"GPU {main_gpu}: {gpu0_used:.1f}GB/{gpu0_total:.1f}GB (Free: {gpu0_free:.1f}GB)")
         print(f"GPU {worker_gpu}: {gpu1_used:.1f}GB/{gpu1_total:.1f}GB (Free: {gpu1_free:.1f}GB)")
         
-        # 2. 检查是否有足够显存
+        # 3. 检查是否有足够显存
         MIN_REQUIRED_MEMORY = 8.0
         if max(gpu0_free, gpu1_free) < MIN_REQUIRED_MEMORY:
             raise RuntimeError(
@@ -857,15 +860,15 @@ def run_inference_process(
                 f"GPU {main_gpu}: {gpu0_free:.1f}GB free, GPU {worker_gpu}: {gpu1_free:.1f}GB free"
             )
         
-        # 3. 选择显存较多的GPU
-        target_gpu = main_gpu if gpu0_free > gpu1_free else worker_gpu
-        print(f"Selected GPU {target_gpu} with {max(gpu0_free, gpu1_free):.1f}GB free memory")
+        # 4. 选择显存较多的GPU
+        target_gpu = 0 if gpu0_free > gpu1_free else 1  # 因为CUDA_VISIBLE_DEVICES已设置，这里用0,1
+        actual_gpu = main_gpu if target_gpu == 0 else worker_gpu
+        print(f"Selected GPU {actual_gpu} with {max(gpu0_free, gpu1_free):.1f}GB free memory")
         
-        # 4. 清理JAX缓存
+        # 5. 清理JAX缓存
         jax.clear_caches()
         
-        # 5. 设置环境变量 - 在JAX初始化前设置
-        os.environ['CUDA_VISIBLE_DEVICES'] = str(target_gpu)
+        # 6. 设置JAX配置
         os.environ.update({
             'XLA_PYTHON_CLIENT_MEM_FRACTION': '0.95',
             'XLA_PYTHON_CLIENT_PREALLOCATE': 'true',
@@ -873,15 +876,14 @@ def run_inference_process(
             'XLA_FORCE_HOST_PLATFORM_DEVICE_COUNT': '1',
             'TF_FORCE_GPU_ALLOW_GROWTH': 'false',
             'XLA_PYTHON_CLIENT_MEM_LIMIT_MB': '14000',
-            'XLA_PYTHON_CLIENT_DEVICE_PRIORITY': '0',  # 强制使用第一个可见设备
         })
         
-        # 6. 重新初始化JAX
+        # 7. 重新初始化JAX
         import importlib
         importlib.reload(jax.lib)
         importlib.reload(jax)
         
-        # 7. 验证JAX设备
+        # 8. 验证JAX设备
         devices = jax.devices('gpu')
         if not devices:
             raise RuntimeError("No GPU devices found")
@@ -889,21 +891,21 @@ def run_inference_process(
         print(f"Current CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES')}")
         print(f"Current JAX backend: {jax.default_backend()}")
         
-        # 8. 创建模型实例
-        with jax.default_device(devices[0]):
+        # 9. 创建模型实例
+        with jax.default_device(devices[target_gpu]):  # 使用选择的GPU
             inference_model = ModelRunner(
                 config=model_config,
-                device=devices[0],
+                device=devices[target_gpu],
                 model_dir=model_dir
             )
             print("Successfully created model runner")
             
-            # 9. 运行推理
+            # 10. 运行推理
             print("Starting inference...")
             result = inference_model.run_inference(featurised_example, rng_key)
             print("Inference completed successfully")
         
-        # 10. 确保结果在CPU上
+        # 11. 确保结果在CPU上
         result = jax.tree_util.tree_map(
             lambda x: np.array(x) if isinstance(x, (np.ndarray, jnp.ndarray)) else x,
             result
@@ -916,8 +918,8 @@ def run_inference_process(
         print(f"Current CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES')}")
         print(f"JAX devices: {jax.devices()}")
         print(f"Current JAX backend: {jax.default_backend()}")
-        used, total = get_gpu_memory_info(target_gpu)
-        print(f"GPU {target_gpu} memory at error: {used:.1f}GB/{total:.1f}GB")
+        used, total = get_gpu_memory_info(actual_gpu)
+        print(f"GPU {actual_gpu} memory at error: {used:.1f}GB/{total:.1f}GB")
         raise
 
 def main(_):
