@@ -429,12 +429,12 @@ def predict_structure(
     
     # 创建进程池用于推理
     ctx = multiprocessing.get_context('spawn')
-    with ctx.Pool(1, maxtasksperchild=1) as pool:  # 每个任务后重新创建进程
+    
+    # 使用start_method='spawn'创建新进程
+    with ctx.Pool(1, maxtasksperchild=1) as pool:
         for seed, example in zip(fold_input.rng_seeds, featurised_examples):
             print(f'Running inference for seed {seed}...')
             
-            # 只在GPU 1上运行推理
-            rng_key = jax.random.PRNGKey(seed)
             try:
                 result = pool.apply(
                     run_inference_process,
@@ -447,8 +447,9 @@ def predict_structure(
                         True,
                     )
                 )
+                print(f"Inference completed successfully for seed {seed}")
             except Exception as e:
-                print(f"Error in inference process: {str(e)}")
+                print(f"Error in inference process for seed {seed}: {str(e)}")
                 raise
             
             # 在主进程（GPU 0）上提取结构和embeddings
@@ -766,89 +767,79 @@ def run_inference_process(
     is_worker_gpu: bool = False,
 ) -> model.ModelResult:
     """在独立进程中运行推理"""
-    # 设置基本环境变量
-    os.environ.update({
-        'CUDA_VISIBLE_DEVICES': str(gpu_id),
-        # JAX配置
-        'XLA_PYTHON_CLIENT_MEM_FRACTION': '0.95',
-        'XLA_PYTHON_CLIENT_PREALLOCATE': 'false',
-        'XLA_PYTHON_CLIENT_ALLOCATOR': 'platform',
-        'TF_FORCE_GPU_ALLOW_GROWTH': 'true',
-        # JAX CUDA配置
-        'XLA_FLAGS': '--xla_gpu_force_compilation_parallelism=1'
-    })
-    
-    print(f"Inference process starting on GPU {gpu_id}")
-    print("JAX configuration:")
-    print(f"  CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES')}")
-    print(f"  XLA_PYTHON_CLIENT_MEM_FRACTION: {os.environ.get('XLA_PYTHON_CLIENT_MEM_FRACTION')}")
-    print(f"  XLA_PYTHON_CLIENT_PREALLOCATE: {os.environ.get('XLA_PYTHON_CLIENT_PREALLOCATE')}")
-    
-    # 检查GPU状态
     try:
-        gpu_info = GPUtil.getGPUs()[gpu_id]
-        print(f"GPU {gpu_id} status:")
-        print(f"  Memory Free: {gpu_info.memoryFree}MB")
-        print(f"  Memory Used: {gpu_info.memoryUsed}MB")
-        print(f"  Memory Total: {gpu_info.memoryTotal}MB")
-        print(f"  GPU Load: {gpu_info.load*100:.1f}%")
-    except Exception as e:
-        print(f"Warning: Could not get GPU info: {str(e)}")
-    
-    # 重新初始化JAX
-    try:
-        # 清理缓存
-        jax.clear_caches()
+        # 首先设置CUDA_VISIBLE_DEVICES，这必须在导入JAX之前完成
+        os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
         
-        # 强制重新初始化JAX的GPU后端
-        devices = jax.devices('gpu')
-        print(f"JAX initialized with devices: {devices}")
+        # 重新导入JAX以确保它使用正确的GPU
+        import importlib
+        import jax
+        importlib.reload(jax)
         
-        # 验证GPU是否可用
+        # 设置其他环境变量
+        os.environ.update({
+            'XLA_PYTHON_CLIENT_MEM_FRACTION': '0.95',
+            'XLA_PYTHON_CLIENT_PREALLOCATE': 'false',
+            'XLA_PYTHON_CLIENT_ALLOCATOR': 'platform',
+            'TF_FORCE_GPU_ALLOW_GROWTH': 'true',
+            'XLA_FLAGS': '--xla_gpu_force_compilation_parallelism=1'
+        })
+        
+        print(f"Inference process starting on GPU {gpu_id}")
+        print("JAX configuration:")
+        print(f"  CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES')}")
+        
+        # 检查GPU状态
+        try:
+            gpu_info = GPUtil.getGPUs()[0]  # 因为设置了CUDA_VISIBLE_DEVICES，所以这里应该只能看到一个GPU
+            print(f"GPU status:")
+            print(f"  Memory Free: {gpu_info.memoryFree}MB")
+            print(f"  Memory Used: {gpu_info.memoryUsed}MB")
+            print(f"  Memory Total: {gpu_info.memoryTotal}MB")
+            print(f"  GPU Load: {gpu_info.load*100:.1f}%")
+        except Exception as e:
+            print(f"Warning: Could not get GPU info: {str(e)}")
+        
+        # 初始化JAX设备
+        devices = jax.devices()
         if not devices:
             raise RuntimeError("No GPU devices found after JAX initialization")
-            
-    except Exception as e:
-        print(f"Error during JAX initialization: {str(e)}")
-        raise
-    
-    # 创建模型实例
-    try:
+        print(f"Available devices: {devices}")
+        
+        # 创建模型实例
         inference_model = ModelRunner(
             config=model_config,
-            device=devices[0],
+            device=devices[0],  # 因为设置了CUDA_VISIBLE_DEVICES，这里的devices[0]就是我们想要的GPU
             model_dir=model_dir
         )
         print("Successfully created model runner")
-    except Exception as e:
-        print(f"Error creating model runner: {str(e)}")
-        print(f"Current JAX devices: {jax.devices()}")
-        raise
-    
-    # 运行推理
-    try:
+        
+        # 运行推理
         print("Starting inference...")
-        with jax.default_device(devices[0]):
-            result = inference_model.run_inference(featurised_example, rng_key)
+        result = inference_model.run_inference(featurised_example, rng_key)
         print("Inference completed successfully")
+        
+        # 确保结果在CPU上
+        result = jax.tree_util.tree_map(
+            lambda x: np.array(x) if isinstance(x, (np.ndarray, jnp.ndarray)) else x,
+            result
+        )
+        
+        return result
+        
     except Exception as e:
-        print(f"Error during inference: {str(e)}")
-        print(f"Current JAX devices: {jax.devices()}")
+        print(f"Error in inference process: {str(e)}")
+        print(f"Current environment:")
+        print(f"  CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES')}")
+        print(f"  Available devices: {jax.devices()}")
         try:
-            gpu_info = GPUtil.getGPUs()[gpu_id]
-            print(f"GPU {gpu_id} status at error:")
+            gpu_info = GPUtil.getGPUs()[0]
+            print(f"GPU status at error:")
             print(f"  Memory Free: {gpu_info.memoryFree}MB")
+            print(f"  Memory Used: {gpu_info.memoryUsed}MB")
         except:
             pass
         raise
-    
-    # 确保结果在CPU上
-    result = jax.tree_util.tree_map(
-        lambda x: np.array(x) if isinstance(x, (np.ndarray, jnp.ndarray)) else x,
-        result
-    )
-    
-    return result
 
 class DynamicGPUModelRunner(ModelRunner):
     def __init__(self, *args, **kwargs):
