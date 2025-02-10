@@ -521,6 +521,16 @@ def predict_structure(
     selected_gpu = worker_gpu if gpu1_free >= MIN_REQUIRED_MEMORY else main_gpu
     print(f"\n=== GPU Selection Result ===")
     print(f"Selected GPU {selected_gpu} for inference")
+    try:
+        gpu_devices = jax.devices('gpu')
+        print(f"Available GPU devices to JAX: {gpu_devices}")
+        for device in gpu_devices:
+            print(f"  - Device: {device}")
+            print(f"    Platform: {device.platform}")
+            print(f"    Device kind: {device.device_kind}")
+            print(f"    Device ID: {device.id}")
+    except Exception as e:
+        print(f"Error getting GPU device information: {e}")
     
     # 创建进程池用于推理
     ctx = multiprocessing.get_context('spawn')
