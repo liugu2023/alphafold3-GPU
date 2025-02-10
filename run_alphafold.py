@@ -860,9 +860,16 @@ def run_inference_process(
                 f"GPU {main_gpu}: {gpu0_free:.1f}GB free, GPU {worker_gpu}: {gpu1_free:.1f}GB free"
             )
         
-        # 4. 选择显存较多的GPU
-        target_gpu = 0 if gpu0_free > gpu1_free else 1  # 因为CUDA_VISIBLE_DEVICES已设置，这里用0,1
-        actual_gpu = main_gpu if target_gpu == 0 else worker_gpu
+        # 4. 选择显存较多的GPU并设置环境变量
+        if gpu0_free > gpu1_free:
+            target_gpu = 0
+            actual_gpu = main_gpu
+            os.environ['CUDA_VISIBLE_DEVICES'] = str(main_gpu)
+        else:
+            target_gpu = 0  # 重置为0，因为我们会重新设置CUDA_VISIBLE_DEVICES
+            actual_gpu = worker_gpu
+            os.environ['CUDA_VISIBLE_DEVICES'] = str(worker_gpu)
+            
         print(f"Selected GPU {actual_gpu} with {max(gpu0_free, gpu1_free):.1f}GB free memory")
         
         # 5. 清理JAX缓存
@@ -891,11 +898,11 @@ def run_inference_process(
         print(f"Current CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES')}")
         print(f"Current JAX backend: {jax.default_backend()}")
         
-        # 9. 创建模型实例
-        with jax.default_device(devices[target_gpu]):  # 使用选择的GPU
+        # 9. 创建模型实例 - 现在devices[0]就是我们选择的GPU
+        with jax.default_device(devices[0]):
             inference_model = ModelRunner(
                 config=model_config,
-                device=devices[target_gpu],
+                device=devices[0],
                 model_dir=model_dir
             )
             print("Successfully created model runner")
