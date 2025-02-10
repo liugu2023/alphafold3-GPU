@@ -32,7 +32,7 @@ import string
 import textwrap
 import time
 import typing
-from typing import overload
+from typing import overload, List, Tuple
 
 from absl import app
 from absl import flags
@@ -52,6 +52,9 @@ import haiku as hk
 import jax
 from jax import numpy as jnp
 import numpy as np
+import psutil
+import GPUtil
+from concurrent.futures import ProcessPoolExecutor
 
 
 _HOME_DIR = pathlib.Path(os.environ.get('HOME'))
@@ -635,6 +638,79 @@ def process_fold_input(
   return output
 
 
+def get_available_gpu_memory() -> float:
+    """获取当前可用的GPU显存(GB)"""
+    try:
+        gpu = GPUtil.getGPUs()[_GPU_DEVICE.value]
+        return gpu.memoryFree / 1024  # 转换为GB
+    except Exception:
+        return 0
+
+def estimate_batch_size(available_memory: float) -> int:
+    """根据可用显存估算每个批次可处理的输入数量
+    
+    Args:
+        available_memory: 可用显存大小(GB)
+    
+    Returns:
+        每个批次可处理的输入数量
+    """
+    # 假设每个输入平均需要2GB显存,可以根据实际情况调整
+    memory_per_input = 2
+    return max(1, int(available_memory / memory_per_input))
+
+def process_batch(
+    fold_inputs: List[folding_input.Input],
+    data_pipeline_config: pipeline.DataPipelineConfig,
+    model_dir: str,
+    output_dir: str,
+    gpu_device: int,
+    buckets: Tuple[int, ...],
+    flash_attention_implementation: str,
+    num_diffusion_samples: int,
+    num_recycles: int,
+    save_embeddings: bool,
+    conformer_max_iterations: int | None = None,
+) -> None:
+    """处理一批输入文件
+    
+    Args:
+        fold_inputs: 需要处理的输入列表
+        data_pipeline_config: 数据管道配置
+        model_dir: 模型目录
+        output_dir: 输出目录
+        gpu_device: GPU设备ID
+        buckets: bucket大小列表
+        flash_attention_implementation: flash attention实现方式
+        num_diffusion_samples: diffusion样本数量
+        num_recycles: recycle次数
+        save_embeddings: 是否保存embeddings
+        conformer_max_iterations: RDKit构象搜索的最大迭代次数
+    """
+    devices = jax.local_devices(backend='gpu')
+    model_runner = ModelRunner(
+        config=make_model_config(
+            flash_attention_implementation=typing.cast(
+                attention.Implementation, flash_attention_implementation
+            ),
+            num_diffusion_samples=num_diffusion_samples,
+            num_recycles=num_recycles,
+            return_embeddings=save_embeddings,
+        ),
+        device=devices[gpu_device],
+        model_dir=pathlib.Path(model_dir),
+    )
+    
+    for fold_input in fold_inputs:
+        process_fold_input(
+            fold_input=fold_input,
+            data_pipeline_config=data_pipeline_config,
+            model_runner=model_runner,
+            output_dir=os.path.join(output_dir, fold_input.sanitised_name()),
+            buckets=buckets,
+            conformer_max_iterations=conformer_max_iterations,
+        )
+
 def main(_):
   if _JAX_COMPILATION_CACHE_DIR.value is not None:
     jax.config.update(
@@ -747,41 +823,87 @@ def main(_):
         f' {devices[_GPU_DEVICE.value]}'
     )
 
-    print('Building model from scratch...')
-    model_runner = ModelRunner(
-        config=make_model_config(
-            flash_attention_implementation=typing.cast(
-                attention.Implementation, _FLASH_ATTENTION_IMPLEMENTATION.value
-            ),
-            num_diffusion_samples=_NUM_DIFFUSION_SAMPLES.value,
-            num_recycles=_NUM_RECYCLES.value,
-            return_embeddings=_SAVE_EMBEDDINGS.value,
-        ),
-        device=devices[_GPU_DEVICE.value],
-        model_dir=pathlib.Path(MODEL_DIR.value),
-    )
-    # Check we can load the model parameters before launching anything.
-    print('Checking that model parameters can be loaded...')
-    _ = model_runner.model_params
-  else:
-    model_runner = None
+    fold_input_list = list(fold_inputs)
+    total_inputs = len(fold_input_list)
+    
+    if total_inputs > 500:  # 当输入文件数量大于500时启用多进程
+        print(f'Processing {total_inputs} inputs using multiple processes...')
+        
+        # 获取CPU核心数作为最大进程数
+        max_workers = min(psutil.cpu_count(logical=False), 8)
+        
+        # 获取可用显存
+        available_memory = get_available_gpu_memory()
+        batch_size = estimate_batch_size(available_memory)
+        
+        # 将输入分成多个批次
+        batches = [
+            fold_input_list[i:i + batch_size]
+            for i in range(0, len(fold_input_list), batch_size)
+        ]
+        
+        print(f'Split inputs into {len(batches)} batches, {batch_size} inputs per batch')
+        
+        with ProcessPoolExecutor(max_workers=max_workers) as executor:
+            futures = []
+            for batch in batches:
+                futures.append(
+                    executor.submit(
+                        process_batch,
+                        fold_inputs=batch,
+                        data_pipeline_config=data_pipeline_config,
+                        model_dir=MODEL_DIR.value,
+                        output_dir=_OUTPUT_DIR.value,
+                        gpu_device=_GPU_DEVICE.value,
+                        buckets=tuple(int(bucket) for bucket in _BUCKETS.value),
+                        flash_attention_implementation=_FLASH_ATTENTION_IMPLEMENTATION.value,
+                        num_diffusion_samples=_NUM_DIFFUSION_SAMPLES.value,
+                        num_recycles=_NUM_RECYCLES.value,
+                        save_embeddings=_SAVE_EMBEDDINGS.value,
+                        conformer_max_iterations=_CONFORMER_MAX_ITERATIONS.value,
+                    )
+                )
+            
+            # 等待所有批次完成
+            for future in futures:
+                future.result()
+    else:
+        # 原有的单进程处理逻辑
+        if _RUN_INFERENCE.value:
+            print('Building model from scratch...')
+            model_runner = ModelRunner(
+                config=make_model_config(
+                    flash_attention_implementation=typing.cast(
+                        attention.Implementation, _FLASH_ATTENTION_IMPLEMENTATION.value
+                    ),
+                    num_diffusion_samples=_NUM_DIFFUSION_SAMPLES.value,
+                    num_recycles=_NUM_RECYCLES.value,
+                    return_embeddings=_SAVE_EMBEDDINGS.value,
+                ),
+                device=devices[_GPU_DEVICE.value],
+                model_dir=pathlib.Path(MODEL_DIR.value),
+            )
+            print('Checking that model parameters can be loaded...')
+            _ = model_runner.model_params
+        else:
+            model_runner = None
 
-  num_fold_inputs = 0
-  for fold_input in fold_inputs:
-    if _NUM_SEEDS.value is not None:
-      print(f'Expanding fold job {fold_input.name} to {_NUM_SEEDS.value} seeds')
-      fold_input = fold_input.with_multiple_seeds(_NUM_SEEDS.value)
-    process_fold_input(
-        fold_input=fold_input,
-        data_pipeline_config=data_pipeline_config,
-        model_runner=model_runner,
-        output_dir=os.path.join(_OUTPUT_DIR.value, fold_input.sanitised_name()),
-        buckets=tuple(int(bucket) for bucket in _BUCKETS.value),
-        conformer_max_iterations=_CONFORMER_MAX_ITERATIONS.value,
-    )
-    num_fold_inputs += 1
+        num_fold_inputs = 0
+        for fold_input in fold_inputs:
+            if _NUM_SEEDS.value is not None:
+                print(f'Expanding fold job {fold_input.name} to {_NUM_SEEDS.value} seeds')
+                fold_input = fold_input.with_multiple_seeds(_NUM_SEEDS.value)
+            process_fold_input(
+                fold_input=fold_input,
+                data_pipeline_config=data_pipeline_config,
+                model_runner=model_runner,
+                output_dir=os.path.join(_OUTPUT_DIR.value, fold_input.sanitised_name()),
+                buckets=tuple(int(bucket) for bucket in _BUCKETS.value),
+                conformer_max_iterations=_CONFORMER_MAX_ITERATIONS.value,
+            )
+            num_fold_inputs += 1
 
-  print(f'Done running {num_fold_inputs} fold jobs.')
+        print(f'Done running {num_fold_inputs} fold jobs.')
 
 
 if __name__ == '__main__':
