@@ -686,15 +686,14 @@ def process_batch(
     conformer_max_iterations: int | None = None,
 ) -> None:
     """处理一批输入文件"""
-    # 在子进程中设置环境变量，限制只能看到worker GPU
+    print(f"Worker process starting with GPU {worker_gpu}")
     os.environ['CUDA_VISIBLE_DEVICES'] = str(worker_gpu)
     
-    # 重新初始化GPU设备
     devices = jax.local_devices(backend='gpu')
+    print(f"Worker process found devices: {devices}")
     if not devices:
         raise RuntimeError(f"No GPU devices found for worker process")
     
-    # 由于设置了CUDA_VISIBLE_DEVICES，现在worker_gpu会被映射为0
     model_runner = ModelRunner(
         config=make_model_config(
             flash_attention_implementation=typing.cast(
@@ -704,11 +703,12 @@ def process_batch(
             num_recycles=num_recycles,
             return_embeddings=save_embeddings,
         ),
-        device=devices[0],  # 使用映射后的GPU ID (0)
+        device=devices[0],
         model_dir=pathlib.Path(model_dir),
     )
     
     for fold_input in fold_inputs:
+        print(f"Worker process processing input: {fold_input.name}")
         process_fold_input(
             fold_input=fold_input,
             data_pipeline_config=data_pipeline_config,
@@ -717,6 +717,7 @@ def process_batch(
             buckets=buckets,
             conformer_max_iterations=conformer_max_iterations,
         )
+    print(f"Worker process completed batch")
 
 def get_gpu_mapping():
     """获取实际GPU ID到CUDA_VISIBLE_DEVICES映射的GPU ID的转换"""
@@ -866,65 +867,64 @@ def main(_):
             print(f"Processing {total_inputs} inputs...")
             
             if total_inputs > 500:
-                # 多进程处理逻辑
                 try:
                     max_workers = min(psutil.cpu_count(logical=False), 8)
-                    # 注意：此时无法检查 GPU 1 的显存，因为环境变量限制了只能看到 GPU 0
-                    # 所以我们暂时恢复环境变量来检查 GPU 1
+                    
+                    # 临时恢复环境变量来检查 GPU 1
+                    original_visible_devices = os.environ.get('CUDA_VISIBLE_DEVICES')
                     os.environ['CUDA_VISIBLE_DEVICES'] = '0,1'
                     available_memory = get_available_gpu_memory(_WORKER_GPU.value)
-                    # 检查完后立即恢复主进程的 GPU 设置
-                    os.environ['CUDA_VISIBLE_DEVICES'] = str(_MAIN_GPU.value)
+                    
+                    # 恢复主进程的 GPU 设置
+                    if original_visible_devices is not None:
+                        os.environ['CUDA_VISIBLE_DEVICES'] = original_visible_devices
+                    else:
+                        os.environ['CUDA_VISIBLE_DEVICES'] = str(_MAIN_GPU.value)
                     
                     batch_size = estimate_batch_size(available_memory)
                     print(f"Available GPU memory on worker GPU: {available_memory:.2f}GB")
                     print(f"Estimated batch size: {batch_size}")
                     print(f"Number of workers: {max_workers}")
                     
-                    # 创建子进程时，通过环境变量指定使用 GPU 1
-                    env = os.environ.copy()
-                    env['CUDA_VISIBLE_DEVICES'] = str(_WORKER_GPU.value)
+                    # 将输入分成批次
+                    batches = [
+                        fold_input_list[i:i + batch_size]
+                        for i in range(0, total_inputs, batch_size)
+                    ]
+                    print(f"Split {total_inputs} inputs into {len(batches)} batches")
                     
-                    # 使用自定义的 ProcessPoolExecutor 来设置子进程的环境变量
-                    class GPUProcessPoolExecutor(ProcessPoolExecutor):
-                        def __init__(self, *args, **kwargs):
-                            self.worker_env = kwargs.pop('env', {})
-                            super().__init__(*args, **kwargs)
-                        
-                        def submit(self, fn, *args, **kwargs):
-                            def wrapped_fn(*args, **kwargs):
-                                for k, v in self.worker_env.items():
-                                    os.environ[k] = v
-                                return fn(*args, **kwargs)
-                            return super().submit(wrapped_fn, *args, **kwargs)
-                    
-                    with GPUProcessPoolExecutor(max_workers=max_workers, env={'CUDA_VISIBLE_DEVICES': str(_WORKER_GPU.value)}) as executor:
+                    # 使用multiprocessing.Pool而不是ProcessPoolExecutor
+                    with multiprocessing.Pool(
+                        processes=max_workers,
+                        initializer=lambda: os.environ.update({'CUDA_VISIBLE_DEVICES': str(_WORKER_GPU.value)})
+                    ) as pool:
                         futures = []
-                        for i, batch in enumerate(fold_input_list):
-                            print(f"Submitting batch {i+1}/{total_inputs} with {len(batch)} inputs")
-                            futures.append(
-                                executor.submit(
-                                    process_batch,
-                                    fold_inputs=batch,
-                                    data_pipeline_config=data_pipeline_config,
-                                    model_dir=MODEL_DIR.value,
-                                    output_dir=_OUTPUT_DIR.value,
-                                    main_gpu=_MAIN_GPU.value,
-                                    worker_gpu=_WORKER_GPU.value,
-                                    buckets=tuple(int(bucket) for bucket in _BUCKETS.value),
-                                    flash_attention_implementation=_FLASH_ATTENTION_IMPLEMENTATION.value,
-                                    num_diffusion_samples=_NUM_DIFFUSION_SAMPLES.value,
-                                    num_recycles=_NUM_RECYCLES.value,
-                                    save_embeddings=_SAVE_EMBEDDINGS.value,
-                                    conformer_max_iterations=_CONFORMER_MAX_ITERATIONS.value,
-                                )
+                        for i, batch in enumerate(batches):
+                            print(f"Submitting batch {i+1}/{len(batches)} with {len(batch)} inputs")
+                            future = pool.apply_async(
+                                process_batch,
+                                kwds={
+                                    'fold_inputs': batch,
+                                    'data_pipeline_config': data_pipeline_config,
+                                    'model_dir': MODEL_DIR.value,
+                                    'output_dir': _OUTPUT_DIR.value,
+                                    'main_gpu': _MAIN_GPU.value,
+                                    'worker_gpu': _WORKER_GPU.value,
+                                    'buckets': tuple(int(bucket) for bucket in _BUCKETS.value),
+                                    'flash_attention_implementation': _FLASH_ATTENTION_IMPLEMENTATION.value,
+                                    'num_diffusion_samples': _NUM_DIFFUSION_SAMPLES.value,
+                                    'num_recycles': _NUM_RECYCLES.value,
+                                    'save_embeddings': _SAVE_EMBEDDINGS.value,
+                                    'conformer_max_iterations': _CONFORMER_MAX_ITERATIONS.value,
+                                }
                             )
+                            futures.append((i, future))
                         
                         # 等待并检查每个批次的结果
-                        for i, future in enumerate(futures):
+                        for i, future in futures:
                             try:
-                                future.result()
-                                print(f"Batch {i+1}/{total_inputs} completed successfully")
+                                future.get()  # 这会抛出子进程中的任何异常
+                                print(f"Batch {i+1}/{len(batches)} completed successfully")
                             except Exception as e:
                                 print(f"Error processing batch {i+1}: {str(e)}")
                                 raise
