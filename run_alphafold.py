@@ -405,127 +405,6 @@ class ResultsForSeed:
   embeddings: dict[str, np.ndarray] | None = None
 
 
-def predict_structure(
-    fold_input: folding_input.Input,
-    model_runner: ModelRunner,
-    main_gpu: int,
-    worker_gpu: int,
-    buckets: Sequence[int] | None = None,
-    conformer_max_iterations: int | None = None,
-) -> Sequence[ResultsForSeed]:
-    """在主进程中处理特征化，在GPU上运行推理"""
-    results = []
-    
-    # 1. 在开始前检查GPU显存状态
-    gpu0_used, gpu0_total = get_gpu_memory_info(main_gpu)
-    gpu1_used, gpu1_total = get_gpu_memory_info(worker_gpu)
-    gpu0_free = gpu0_total - gpu0_used
-    gpu1_free = gpu1_total - gpu1_used
-    
-    print("\n=== Initial GPU Memory Status ===")
-    print(f"GPU {main_gpu}: Used={gpu0_used:.1f}GB/Total={gpu0_total:.1f}GB (Free: {gpu0_free:.1f}GB)")
-    print(f"GPU {worker_gpu}: Used={gpu1_used:.1f}GB/Total={gpu1_total:.1f}GB (Free: {gpu1_free:.1f}GB)")
-    
-    # 2. 在主进程上进行特征化
-    print(f'\nFeaturising data with {len(fold_input.rng_seeds)} seed(s)...')
-    featurisation_start_time = time.time()
-    ccd = chemical_components.cached_ccd(user_ccd=fold_input.user_ccd)
-    featurised_examples = featurisation.featurise_input(
-        fold_input=fold_input,
-        buckets=buckets,
-        ccd=ccd,
-        verbose=True,
-        conformer_max_iterations=conformer_max_iterations,
-    )
-    print(
-        f'Featurising data took {time.time() - featurisation_start_time:.2f} seconds.'
-    )
-    
-    # 3. 彻底清理特征化过程占用的显存
-    print("\n=== Cleaning up GPU memory after featurisation ===")
-    
-    # 清理 PyTorch 缓存和显存
-    torch.cuda.empty_cache()
-    if torch.cuda.is_available():
-        for i in range(torch.cuda.device_count()):
-            with torch.cuda.device(i):
-                torch.cuda.empty_cache()
-                torch.cuda.ipc_collect()
-    
-    # 清理 JAX 缓存
-    jax.clear_caches()
-    
-    # 强制 Python 垃圾回收
-    gc.collect()
-    gc.collect()
-    
-    # 删除可能的大对象
-    del ccd
-    gc.collect()
-    
-    # 等待 GPU 操作完成
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
-    
-    print("Memory cleanup completed")
-    
-    # 4. 检查清理后的显存状态
-    gpu0_used, gpu0_total = get_gpu_memory_info(main_gpu)
-    gpu1_used, gpu1_total = get_gpu_memory_info(worker_gpu)
-    gpu0_free = gpu0_total - gpu0_used
-    gpu1_free = gpu1_total - gpu1_used
-    
-    print("\n=== GPU Memory Status After Cleanup ===")
-    print(f"GPU {main_gpu}: Used={gpu0_used:.1f}GB/Total={gpu0_total:.1f}GB (Free: {gpu0_free:.1f}GB)")
-    print(f"GPU {worker_gpu}: Used={gpu1_used:.1f}GB/Total={gpu1_total:.1f}GB (Free: {gpu1_free:.1f}GB)")
-    
-    # 5. 选择显存较多的GPU进行推理
-    MIN_REQUIRED_MEMORY = 8.0
-    selected_gpu = worker_gpu if gpu1_free >= MIN_REQUIRED_MEMORY else main_gpu
-    print(f"\n=== GPU Selection Result ===")
-    print(f"Selected GPU {selected_gpu} for inference")
-    
-    # 6. 创建进程池用于推理
-    ctx = multiprocessing.get_context('spawn')
-    with ctx.Pool(1, maxtasksperchild=1) as pool:
-        for seed, example in zip(fold_input.rng_seeds, featurised_examples):
-            print(f'Running inference for seed {seed}...')
-            
-            rng_key = jax.random.PRNGKey(seed)
-            
-            result = pool.apply(
-                run_inference_process,
-                args=(
-                    example,
-                    rng_key,
-                    model_runner._model_config,
-                    model_runner._model_dir,
-                    selected_gpu,
-                )
-            )
-            
-            # 处理结果...
-            inference_results = model_runner.extract_structures(
-                batch=example, result=result, target_name=fold_input.name
-            )
-            embeddings = model_runner.extract_embeddings(result)
-            
-            results.append(
-                ResultsForSeed(
-                    seed=seed,
-                    inference_results=inference_results,
-                    full_fold_input=fold_input,
-                    embeddings=embeddings,
-                )
-            )
-            
-            # 清理内存
-            del result, inference_results, embeddings
-            jax.clear_caches()
-            gc.collect()
-    
-    return results
-
 def write_fold_input_json(
     fold_input: folding_input.Input,
     output_dir: os.PathLike[str] | str,
@@ -888,12 +767,7 @@ def run_inference_process(
 ) -> model.ModelResult:
     """在指定GPU上运行推理"""
     try:
-        print("\n=== Inference Process Device Information ===")
-        print(f"Requested GPU ID: {gpu_id}")
-        print(f"Initial CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES', 'Not set')}")
-        print(f"Initial JAX devices: {jax.devices()}")
-        
-        # 1. 设置环境变量
+        # 1. 在导入或使用JAX之前设置环境变量
         os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
         os.environ.update({
             'XLA_PYTHON_CLIENT_MEM_FRACTION': '0.95',
@@ -904,15 +778,19 @@ def run_inference_process(
             'XLA_PYTHON_CLIENT_MEM_LIMIT_MB': '14000',
         })
         
-        # 2. 清理JAX缓存并重新初始化
-        jax.clear_caches()
-        import importlib
-        importlib.reload(jax.lib)
-        importlib.reload(jax)
+        # 2. 重新导入JAX以确保它看到新的环境变量
+        import sys
+        if 'jax' in sys.modules:
+            del sys.modules['jax']
+            del sys.modules['jax._src']
+        import jax
+        
+        print("\n=== Inference Process Device Information ===")
+        print(f"Requested GPU ID: {gpu_id}")
+        print(f"CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES', 'Not set')}")
         
         # 3. 验证JAX设备并输出详细信息
-        print("\n=== JAX Configuration After Initialization ===")
-        print(f"CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES', 'Not set')}")
+        print("\n=== JAX Configuration ===")
         print(f"JAX backend: {jax.default_backend()}")
         print(f"All JAX devices: {jax.devices()}")
         print(f"Default JAX device: {jax.default_device()}")
@@ -937,7 +815,7 @@ def run_inference_process(
                 model_dir=model_dir
             )
             result = inference_model.run_inference(featurised_example, rng_key)
-            
+        
         # 5. 确保结果在CPU上
         result = jax.tree_util.tree_map(
             lambda x: np.array(x) if isinstance(x, (np.ndarray, jnp.ndarray)) else x,
