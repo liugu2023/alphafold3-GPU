@@ -271,6 +271,9 @@ _SAVE_EMBEDDINGS = flags.DEFINE_bool(
     'Whether to save the final trunk single and pair embeddings in the output.',
 )
 
+# 在文件开头添加计时开始
+_start_time = time.time()
+
 
 def make_model_config(
     *,
@@ -779,6 +782,10 @@ def main(_):
     num_fold_inputs += 1
 
   print(f'Done running {num_fold_inputs} fold jobs.')
+
+  # 在程序结束时输出总运行时间
+  total_time = time.time() - _start_time
+  print(f'总运行时间: {total_time:.2f} 秒')
 
 
 if __name__ == '__main__':
