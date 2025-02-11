@@ -784,13 +784,7 @@ def run_inference_process(
     try:
         print("\n=== Setting up inference environment ===")
         
-        # 1. 删除所有已导入的JAX相关模块
-        import sys
-        for k in list(sys.modules.keys()):
-            if k.startswith('jax') or k.startswith('xla'):
-                del sys.modules[k]
-        
-        # 2. 设置环境变量（在导入JAX之前）
+        # 1. 设置环境变量（在任何导入之前）
         print(f"\n=== Setting environment variables for GPU {gpu_id} ===")
         os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
         os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '0.95'
@@ -800,12 +794,14 @@ def run_inference_process(
         os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'false'
         os.environ['XLA_PYTHON_CLIENT_MEM_LIMIT_MB'] = '14000'
         
-        # 3. 导入必要的模块
-        print("\n=== Importing JAX in child process ===")
-        import jax.numpy as jnp  # 这会触发JAX的初始化
+        # 2. 重新导入必要的模块
+        print("\n=== Importing JAX and related modules ===")
         import jax
+        import jax.numpy as jnp
+        from jax import random
+        from jax import tree_util
         
-        # 4. 验证JAX配置
+        # 3. 验证JAX配置
         print("\n=== Verifying JAX configuration ===")
         print(f"Process environment:")
         print(f"- CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES')}")
@@ -816,7 +812,7 @@ def run_inference_process(
         print(f"- Available devices: {jax.devices()}")
         print(f"- Default device: {jax.default_device()}")
         
-        # 5. 获取GPU设备
+        # 4. 获取GPU设备
         devices = jax.devices('gpu')
         if not devices:
             raise RuntimeError(f"No GPU devices found in child process. CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES')}")
@@ -827,7 +823,7 @@ def run_inference_process(
         print(f"- Device kind: {device.device_kind}")
         print(f"- Device ID: {device.id}")
         
-        # 6. 运行推理
+        # 5. 运行推理
         print(f"\n=== Running inference on GPU {gpu_id} ===")
         with jax.default_device(device):
             inference_model = ModelRunner(
@@ -846,6 +842,7 @@ def run_inference_process(
         print(f"- CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES')}")
         print(f"- Current working directory: {os.getcwd()}")
         print(f"- Python path: {sys.path}")
+        print(f"- PYTHONPATH: {os.environ.get('PYTHONPATH', '')}")
         raise
 
 def main(_):
