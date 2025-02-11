@@ -52,6 +52,9 @@ import haiku as hk
 import jax
 from jax import numpy as jnp
 import numpy as np
+import gc
+import nvidia_smi
+import torch
 
 
 _HOME_DIR = pathlib.Path(os.environ.get('HOME'))
@@ -273,6 +276,58 @@ _SAVE_EMBEDDINGS = flags.DEFINE_bool(
 
 # 在文件开头添加计时开始
 _start_time = time.time()
+
+
+def clear_gpu_memory():
+    """清理GPU内存的通用函数"""
+    try:
+        import gc
+        import torch
+        gc.collect()
+        torch.cuda.empty_cache()
+        jax.clear_caches()
+    except:
+        pass
+
+def get_gpu_memory():
+    """获取GPU内存使用情况
+    
+    Returns:
+        dict: 包含used(已用)、total(总量)、free(可用)的内存信息(MB)
+    """
+    try:
+        import nvidia_smi
+        nvidia_smi.nvmlInit()
+        handle = nvidia_smi.nvmlDeviceGetHandleByIndex(0)
+        info = nvidia_smi.nvmlDeviceGetMemoryInfo(handle)
+        return {
+            'used': info.used / 1024**2,    # 转换为MB
+            'total': info.total / 1024**2,   # 转换为MB
+            'free': info.free / 1024**2      # 转换为MB
+        }
+    except Exception as e:
+        print(f"Warning: Failed to get GPU memory info: {e}")
+        # 返回默认值
+        return {
+            'used': 0,
+            'total': 16*1024,  # 假设16GB总内存
+            'free': 16*1024
+        }
+
+def check_gpu_memory(threshold_mb=1000):
+    """检查是否有足够的GPU内存
+    
+    Args:
+        threshold_mb: 最小所需的可用内存(MB)
+        
+    Returns:
+        bool: 是否有足够的可用内存
+    """
+    mem_info = get_gpu_memory()
+    if mem_info['free'] < threshold_mb:
+        print(f"Warning: Low GPU memory - only {mem_info['free']:.0f}MB free")
+        return False
+    return True
 
 
 def make_model_config(
