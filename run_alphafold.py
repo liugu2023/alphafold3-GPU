@@ -416,44 +416,100 @@ def predict_structure(
     """在指定GPU上运行推理"""
     results = []
     
-    # 1. 在主进程上进行特征化
-    print(f'\nFeaturising data with {len(fold_input.rng_seeds)} seed(s)...')
-    featurisation_start_time = time.time()
-    ccd = chemical_components.cached_ccd(user_ccd=fold_input.user_ccd)
-    featurised_examples = featurisation.featurise_input(
-        fold_input=fold_input,
-        buckets=buckets,
-        ccd=ccd,
-        verbose=True,
-        conformer_max_iterations=conformer_max_iterations,
-    )
-    print(f'Featurising data took {time.time() - featurisation_start_time:.2f} seconds.')
-    
-    # 2. 清理特征化过程占用的显存
-    # ... 清理代码保持不变 ...
-    
-    # 3. 创建进程池用于推理
-    ctx = multiprocessing.get_context('spawn')
-    with ctx.Pool(1, maxtasksperchild=1) as pool:
-        for seed, example in zip(fold_input.rng_seeds, featurised_examples):
-            print(f'Running inference for seed {seed}...')
-            
-            rng_key = jax.random.PRNGKey(seed)
-            
-            result = pool.apply(
-                run_inference_process,
-                args=(
-                    example,
-                    rng_key,
-                    model_runner._model_config,
-                    model_runner._model_dir,
-                    inference_gpu,  # 使用传入的GPU ID
-                )
+    try:
+        # 1. 在特征化之前检查显存状态
+        gpu_used, gpu_total = get_gpu_memory_info(inference_gpu)
+        print(f"\n=== GPU Memory Before Featurisation ===")
+        print(f"GPU {inference_gpu}: Used={gpu_used:.1f}GB/Total={gpu_total:.1f}GB (Free: {gpu_total-gpu_used:.1f}GB)")
+        
+        # 2. 在主进程上进行特征化
+        print(f'\nFeaturising data with {len(fold_input.rng_seeds)} seed(s)...')
+        featurisation_start_time = time.time()
+        
+        # 确保在特征化过程中清理显存
+        torch.cuda.empty_cache()
+        gc.collect()
+        
+        ccd = chemical_components.cached_ccd(user_ccd=fold_input.user_ccd)
+        featurised_examples = featurisation.featurise_input(
+            fold_input=fold_input,
+            buckets=buckets,
+            ccd=ccd,
+            verbose=True,
+            conformer_max_iterations=conformer_max_iterations,
+        )
+        print(f'Featurising data took {time.time() - featurisation_start_time:.2f} seconds.')
+        
+        # 3. 立即清理特征化过程的显存
+        print("\n=== Cleaning up GPU memory after featurisation ===")
+        del ccd
+        torch.cuda.empty_cache()
+        gc.collect()
+        
+        # 4. 再次检查显存状态
+        gpu_used, gpu_total = get_gpu_memory_info(inference_gpu)
+        print(f"\n=== GPU Memory After Cleanup ===")
+        print(f"GPU {inference_gpu}: Used={gpu_used:.1f}GB/Total={gpu_total:.1f}GB (Free: {gpu_total-gpu_used:.1f}GB)")
+        
+        # 5. 验证是否有足够显存进行推理
+        MIN_REQUIRED_MEMORY = 8.0
+        if (gpu_total - gpu_used) < MIN_REQUIRED_MEMORY:
+            raise RuntimeError(
+                f"Insufficient GPU memory for inference after featurisation. "
+                f"Need at least {MIN_REQUIRED_MEMORY}GB, but only have {gpu_total-gpu_used:.1f}GB free on GPU {inference_gpu}"
             )
-            
-            # ... 结果处理代码保持不变 ...
-    
-    return results
+        
+        # 6. 创建进程池用于推理
+        ctx = multiprocessing.get_context('spawn')
+        with ctx.Pool(1, maxtasksperchild=1) as pool:
+            for seed, example in zip(fold_input.rng_seeds, featurised_examples):
+                print(f'Running inference for seed {seed}...')
+                rng_key = jax.random.PRNGKey(seed)
+                
+                result = pool.apply(
+                    run_inference_process,
+                    args=(
+                        example,
+                        rng_key,
+                        model_runner._model_config,
+                        model_runner._model_dir,
+                        inference_gpu,
+                    )
+                )
+                
+                # 处理结果并立即清理显存
+                inference_results = model_runner.extract_structures(
+                    batch=example, result=result, target_name=fold_input.name
+                )
+                embeddings = model_runner.extract_embeddings(result)
+                
+                results.append(
+                    ResultsForSeed(
+                        seed=seed,
+                        inference_results=inference_results,
+                        full_fold_input=fold_input,
+                        embeddings=embeddings,
+                    )
+                )
+                
+                # 清理本次推理的内存
+                del result, inference_results, embeddings
+                torch.cuda.empty_cache()
+                gc.collect()
+                
+                # 检查显存状态
+                gpu_used, gpu_total = get_gpu_memory_info(inference_gpu)
+                print(f"\n=== GPU Memory After Inference ===")
+                print(f"GPU {inference_gpu}: Used={gpu_used:.1f}GB/Total={gpu_total:.1f}GB (Free: {gpu_total-gpu_used:.1f}GB)")
+        
+        return results
+        
+    except Exception as e:
+        print(f"\n=== Error in predict_structure ===")
+        print(f"Error message: {str(e)}")
+        gpu_used, gpu_total = get_gpu_memory_info(inference_gpu)
+        print(f"GPU {inference_gpu} memory at error: Used={gpu_used:.1f}GB/Total={gpu_total:.1f}GB (Free: {gpu_total-gpu_used:.1f}GB)")
+        raise
 
 def write_fold_input_json(
     fold_input: folding_input.Input,
@@ -579,6 +635,25 @@ def process_fold_input(
     print(f"GPU {main_gpu}: Used={gpu0_used:.1f}GB/Total={gpu0_total:.1f}GB (Free: {gpu0_free:.1f}GB)")
     print(f"GPU {worker_gpu}: Used={gpu1_used:.1f}GB/Total={gpu1_total:.1f}GB (Free: {gpu1_free:.1f}GB)")
     
+    # 输出当前JAX设备信息
+    print("\n=== Current JAX Configuration ===")
+    print(f"CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES', 'Not set')}")
+    print(f"JAX backend: {jax.default_backend()}")
+    print(f"All visible devices to JAX: {jax.devices()}")
+    print(f"Default device: {jax.default_device()}")
+    
+    try:
+        gpu_devices = jax.devices('gpu')
+        print("\n=== Available GPU Devices to JAX ===")
+        for device in gpu_devices:
+            print(f"  - Device: {device}")
+            print(f"    Platform: {device.platform}")
+            print(f"    Device kind: {device.device_kind}")
+            print(f"    Device ID: {device.id}")
+    except Exception as e:
+        print(f"Error getting GPU device information: {e}")
+    
+    # 选择推理GPU
     MIN_REQUIRED_MEMORY = 8.0
     inference_gpu = worker_gpu if gpu1_free >= MIN_REQUIRED_MEMORY else main_gpu
     print(f"\n=== GPU Selection Result ===")
