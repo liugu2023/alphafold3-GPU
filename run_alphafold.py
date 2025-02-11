@@ -33,9 +33,6 @@ import textwrap
 import time
 import typing
 from typing import overload
-import hashlib
-import pickle
-from functools import lru_cache
 
 from absl import app
 from absl import flags
@@ -541,51 +538,134 @@ def batch_process_seeds(args_batch):
             
     return results
 
-def get_cache_dir():
-    """获取缓存目录"""
-    cache_dir = pathlib.Path.home() / '.alphafold_cache'
-    cache_dir.mkdir(exist_ok=True)
-    return cache_dir
-
-def compute_input_hash(fold_input: folding_input.Input) -> str:
-    """计算输入数据的哈希值作为缓存键"""
-    input_json = fold_input.to_json()
-    return hashlib.md5(input_json.encode()).hexdigest()
-
-@lru_cache(maxsize=128)
-def cached_featurisation(input_hash: str, fold_input, buckets, ccd, conformer_max_iterations):
-    """使用内存缓存的特征化计算"""
-    return featurisation.featurise_input(
-        fold_input=fold_input,
-        buckets=buckets,
-        ccd=ccd,
-        verbose=True,
-        conformer_max_iterations=conformer_max_iterations,
-    )
-
-def save_cache(cache_key: str, data, cache_type: str):
-    """保存数据到磁盘缓存"""
-    cache_dir = get_cache_dir() / cache_type
-    cache_dir.mkdir(exist_ok=True)
-    cache_file = cache_dir / f"{cache_key}.pkl"
+def benchmark_batch_size(
+    examples: list,
+    model_runner: ModelRunner,
+    batch_size: int,
+    fold_input: folding_input.Input,
+    max_memory_usage_percent: float = 90.0,
+) -> tuple[float, bool]:
+    """测试指定批大小的性能
+    
+    Args:
+        examples: 要处理的样本列表
+        model_runner: 模型运行器
+        batch_size: 要测试的批大小
+        fold_input: 输入数据
+        max_memory_usage_percent: 最大允许的显存使用百分比
+        
+    Returns:
+        tuple[float, bool]: (每个样本的处理时间, 是否成功)
+    """
+    if len(examples) < batch_size:
+        return float('inf'), False
+        
+    # 清理GPU内存
+    clear_gpu_memory()
+    
+    # 检查当前内存状态
+    mem_info = get_gpu_memory()
+    if (mem_info['used'] / mem_info['total']) * 100 > max_memory_usage_percent:
+        return float('inf'), False
     
     try:
-        with cache_file.open('wb') as f:
-            pickle.dump(data, f)
-    except Exception as e:
-        print(f"Warning: Failed to save cache: {e}")
-
-def load_cache(cache_key: str, cache_type: str):
-    """从磁盘缓存加载数据"""
-    cache_file = get_cache_dir() / cache_type / f"{cache_key}.pkl"
-    
-    if cache_file.exists():
+        # 准备测试批次
+        test_examples = examples[:batch_size]
+        test_seeds = [i for i in range(batch_size)]
+        
+        # 创建批量随机密钥
+        rng_keys = jnp.stack([jax.random.PRNGKey(seed) for seed in test_seeds])
+        
+        # 堆叠样本
         try:
-            with cache_file.open('rb') as f:
-                return pickle.load(f)
-        except Exception as e:
-            print(f"Warning: Failed to load cache: {e}")
-    return None
+            from jax import tree
+            tree_map_fn = tree.map
+        except ImportError:
+            from jax import tree_util
+            tree_map_fn = tree_util.tree_map
+            
+        batched_examples = tree_map_fn(lambda *x: jnp.stack(x), *test_examples)
+        
+        # 测试推理时间
+        start_time = time.time()
+        model_runner.run_inference(batched_examples, rng_keys)
+        end_time = time.time()
+        
+        # 计算每个样本的平均处理时间
+        time_per_sample = (end_time - start_time) / batch_size
+        
+        # 检查内存使用是否超过阈值
+        mem_info = get_gpu_memory()
+        if (mem_info['used'] / mem_info['total']) * 100 > max_memory_usage_percent:
+            return float('inf'), False
+            
+        return time_per_sample, True
+        
+    except Exception as e:
+        print(f"Error testing batch size {batch_size}: {e}")
+        return float('inf'), False
+
+def find_optimal_batch_size(
+    examples: list,
+    model_runner: ModelRunner,
+    fold_input: folding_input.Input,
+    max_batch_size: int = 8,
+    min_batch_size: int = 1,
+) -> int:
+    """找到最优的批处理大小
+    
+    Args:
+        examples: 要处理的样本列表
+        model_runner: 模型运行器
+        fold_input: 输入数据
+        max_batch_size: 最大允许的批大小
+        min_batch_size: 最小允许的批大小
+        
+    Returns:
+        int: 最优的批处理大小
+    """
+    print("Finding optimal batch size...")
+    
+    # 获取序列长度
+    seq_length = len(fold_input.chains[0].sequence)
+    
+    # 根据序列长度设置初始最大批大小
+    if seq_length > 1000:
+        max_batch_size = min(2, max_batch_size)
+    elif seq_length > 500:
+        max_batch_size = min(4, max_batch_size)
+    
+    best_batch_size = min_batch_size
+    best_time_per_sample = float('inf')
+    
+    # 测试不同的批大小
+    for batch_size in range(min_batch_size, max_batch_size + 1):
+        print(f"Testing batch size {batch_size}...")
+        
+        time_per_sample, success = benchmark_batch_size(
+            examples=examples,
+            model_runner=model_runner,
+            batch_size=batch_size,
+            fold_input=fold_input,
+        )
+        
+        if not success:
+            print(f"Batch size {batch_size} failed, stopping search")
+            break
+            
+        print(f"Batch size {batch_size}: {time_per_sample:.2f} seconds per sample")
+        
+        # 如果这个批大小的性能更好，更新最优值
+        if time_per_sample < best_time_per_sample:
+            best_time_per_sample = time_per_sample
+            best_batch_size = batch_size
+        else:
+            # 如果性能开始下降，停止搜索
+            print("Performance decreased, stopping search")
+            break
+    
+    print(f"Selected optimal batch size: {best_batch_size}")
+    return best_batch_size
 
 def predict_structure(
     fold_input: folding_input.Input,
@@ -593,51 +673,35 @@ def predict_structure(
     buckets: Sequence[int] | None = None,
     conformer_max_iterations: int | None = None,
 ) -> Sequence[ResultsForSeed]:
-    """使用缓存机制和批处理运行推理流水线来预测每个种子的结构"""
-
-    # 计算输入的哈希值作为缓存键
-    input_hash = compute_input_hash(fold_input)
+    """使用自适应批处理大小的推理流水线来预测结构"""
     
-    # 尝试从缓存加载特征化结果
-    print("Checking featurisation cache...")
-    featurised_examples = load_cache(input_hash, 'featurisation')
+    print(f'Featurising data with {len(fold_input.rng_seeds)} seed(s)...')
+    featurisation_start_time = time.time()
+    ccd = chemical_components.cached_ccd(user_ccd=fold_input.user_ccd)
+    featurised_examples = featurisation.featurise_input(
+        fold_input=fold_input,
+        buckets=buckets,
+        ccd=ccd,
+        verbose=True,
+        conformer_max_iterations=conformer_max_iterations,
+    )
+    print(
+        f'Featurising data with {len(fold_input.rng_seeds)} seed(s) took'
+        f' {time.time() - featurisation_start_time:.2f} seconds.'
+    )
     
-    if featurised_examples is None:
-        print(f'Featurising data with {len(fold_input.rng_seeds)} seed(s)...')
-        featurisation_start_time = time.time()
-        ccd = chemical_components.cached_ccd(user_ccd=fold_input.user_ccd)
-        
-        # 使用内存缓存的特征化
-        featurised_examples = cached_featurisation(
-            input_hash,
-            fold_input,
-            buckets,
-            ccd,
-            conformer_max_iterations
-        )
-        
-        print(
-            f'Featurising data with {len(fold_input.rng_seeds)} seed(s) took'
-            f' {time.time() - featurisation_start_time:.2f} seconds.'
-        )
-        
-        # 保存特征化结果到磁盘缓存
-        save_cache(input_hash, featurised_examples, 'featurisation')
-    else:
-        print("Loaded featurised examples from cache")
+    # 找到最优批大小
+    batch_size = find_optimal_batch_size(
+        examples=featurised_examples,
+        model_runner=model_runner,
+        fold_input=fold_input,
+    )
     
-    # GPU内存监控和批处理逻辑
-    def get_gpu_memory():
-        try:
-            import nvidia_smi
-            nvidia_smi.nvmlInit()
-            handle = nvidia_smi.nvmlDeviceGetHandleByIndex(0)
-            info = nvidia_smi.nvmlDeviceGetMemoryInfo(handle)
-            return info.used / 1024**2
-        except:
-            return 0
-
-    print(f'Current GPU memory usage: {get_gpu_memory():.2f} MB')
+    print(
+        'Running batch inference and extracting output structure samples with'
+        f' {len(fold_input.rng_seeds)} seed(s)...'
+    )
+    all_inference_start_time = time.time()
     
     # 准备批处理参数
     process_args = [
@@ -645,25 +709,16 @@ def predict_structure(
         for seed, example in zip(fold_input.rng_seeds, featurised_examples)
     ]
     
-    # 动态批处理大小设置
-    seq_length = len(fold_input.chains[0].sequence)
-    if seq_length > 1000:
-        batch_size = 1
-    elif seq_length > 500:
-        batch_size = 2
-    else:
-        batch_size = 3
-        
-    print(f'Using batch size {batch_size} for sequence length {seq_length}')
-    
-    # 批处理和线程池逻辑
+    # 将参数分成批次
     batches = [
         process_args[i:i + batch_size]
         for i in range(0, len(process_args), batch_size)
     ]
     
+    # 使用线程池处理批次
     from concurrent.futures import ThreadPoolExecutor
     num_threads = min(2, len(batches))
+    
     print(f'Using {num_threads} threads for batch processing')
     
     all_results = []
@@ -676,7 +731,11 @@ def predict_structure(
             print('Falling back to single sample processing...')
             all_results = [process_single_seed(args) for args in process_args]
     
-    print(f'Final GPU memory usage: {get_gpu_memory():.2f} MB')
+    print(
+        'Running batch inference and extracting output structures with'
+        f' {len(fold_input.rng_seeds)} seed(s) took'
+        f' {time.time() - all_inference_start_time:.2f} seconds.'
+    )
     
     return all_results
 
