@@ -388,43 +388,27 @@ class ResultsForSeed:
   embeddings: dict[str, np.ndarray] | None = None
 
 
-def predict_structure(
-    fold_input: folding_input.Input,
-    model_runner: ModelRunner,
-    buckets: Sequence[int] | None = None,
-    conformer_max_iterations: int | None = None,
-) -> Sequence[ResultsForSeed]:
-  """Runs the full inference pipeline to predict structures for each seed."""
-
-  print(f'Featurising data with {len(fold_input.rng_seeds)} seed(s)...')
-  featurisation_start_time = time.time()
-  ccd = chemical_components.cached_ccd(user_ccd=fold_input.user_ccd)
-  featurised_examples = featurisation.featurise_input(
-      fold_input=fold_input,
-      buckets=buckets,
-      ccd=ccd,
-      verbose=True,
-      conformer_max_iterations=conformer_max_iterations,
-  )
-  print(
-      f'Featurising data with {len(fold_input.rng_seeds)} seed(s) took'
-      f' {time.time() - featurisation_start_time:.2f} seconds.'
-  )
-  print(
-      'Running model inference and extracting output structure samples with'
-      f' {len(fold_input.rng_seeds)} seed(s)...'
-  )
-  all_inference_start_time = time.time()
-  all_inference_results = []
-  for seed, example in zip(fold_input.rng_seeds, featurised_examples):
+def process_single_seed(args):
+    """处理单个种子的推理任务
+    
+    Args:
+        args: tuple containing (seed, example, model_runner, fold_input)
+        
+    Returns:
+        ResultsForSeed object containing inference results
+    """
+    seed, example, model_runner, fold_input = args
     print(f'Running model inference with seed {seed}...')
     inference_start_time = time.time()
+    
     rng_key = jax.random.PRNGKey(seed)
     result = model_runner.run_inference(example, rng_key)
+    
     print(
         f'Running model inference with seed {seed} took'
         f' {time.time() - inference_start_time:.2f} seconds.'
     )
+    
     print(f'Extracting inference results with seed {seed}...')
     extract_structures = time.time()
     inference_results, embeddings = (
@@ -436,21 +420,61 @@ def predict_structure(
         f'Extracting {len(inference_results)} inference samples with'
         f' seed {seed} took {time.time() - extract_structures:.2f} seconds.'
     )
-
-    all_inference_results.append(
-        ResultsForSeed(
-            seed=seed,
-            inference_results=inference_results,
-            full_fold_input=fold_input,
-            embeddings=embeddings,
-        )
+    
+    return ResultsForSeed(
+        seed=seed,
+        inference_results=inference_results,
+        full_fold_input=fold_input,
+        embeddings=embeddings,
     )
-  print(
-      'Running model inference and extracting output structures with'
-      f' {len(fold_input.rng_seeds)} seed(s) took'
-      f' {time.time() - all_inference_start_time:.2f} seconds.'
-  )
-  return all_inference_results
+
+def predict_structure(
+    fold_input: folding_input.Input,
+    model_runner: ModelRunner,
+    buckets: Sequence[int] | None = None,
+    conformer_max_iterations: int | None = None,
+) -> Sequence[ResultsForSeed]:
+    """使用多进程运行完整的推理流水线来预测每个种子的结构"""
+
+    print(f'Featurising data with {len(fold_input.rng_seeds)} seed(s)...')
+    featurisation_start_time = time.time()
+    ccd = chemical_components.cached_ccd(user_ccd=fold_input.user_ccd)
+    featurised_examples = featurisation.featurise_input(
+        fold_input=fold_input,
+        buckets=buckets,
+        ccd=ccd,
+        verbose=True,
+        conformer_max_iterations=conformer_max_iterations,
+    )
+    print(
+        f'Featurising data with {len(fold_input.rng_seeds)} seed(s) took'
+        f' {time.time() - featurisation_start_time:.2f} seconds.'
+    )
+    
+    print(
+        'Running parallel model inference and extracting output structure samples with'
+        f' {len(fold_input.rng_seeds)} seed(s)...'
+    )
+    all_inference_start_time = time.time()
+    
+    # 准备进程池的参数
+    process_args = [
+        (seed, example, model_runner, fold_input)
+        for seed, example in zip(fold_input.rng_seeds, featurised_examples)
+    ]
+    
+    # 使用进程池并行处理
+    num_processes = min(len(fold_input.rng_seeds), multiprocessing.cpu_count())
+    with multiprocessing.Pool(processes=num_processes) as pool:
+        all_inference_results = pool.map(process_single_seed, process_args)
+    
+    print(
+        'Running parallel model inference and extracting output structures with'
+        f' {len(fold_input.rng_seeds)} seed(s) took'
+        f' {time.time() - all_inference_start_time:.2f} seconds.'
+    )
+    
+    return all_inference_results
 
 
 def write_fold_input_json(
