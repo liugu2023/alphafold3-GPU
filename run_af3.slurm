@@ -2,7 +2,7 @@
 #SBATCH --job-name=alphafold
 #SBATCH --partition=hpcq
 #SBATCH --nodelist=compute07
-#SBATCH --gres=gpu:2
+#SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=12
 #SBATCH --mem=128G
 #SBATCH --time=24:00:00
@@ -25,7 +25,7 @@ export JAX_TRACEBACK_FILTERING=off
 
 # 运行AlphaFold
 python /archive/liugu/alphafold3-GPU/run_alphafold.py \
-  --json_path=/archive/liugu/input/processed/1491aa_5KIS.json \
+  --json_path=/archive/liugu/input/processed/583aa_1CF3.json \
   --output_dir=/archive/liugu/output-GPU \
   --model_dir=/archive/liugu/model \
   --norun_data_pipeline \
