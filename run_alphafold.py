@@ -454,12 +454,32 @@ def batch_process_seeds(args_batch):
     
     # 批量推理
     try:
-        # 将examples堆叠成批处理形式
-        batched_examples = jax.tree_map(
-            lambda *x: jnp.stack(x),
-            *examples
-        )
+        # 将examples堆叠成批处理形式 - 使用新的API
+        try:
+            # 尝试使用新版本API
+            from jax import tree
+            batched_examples = tree.map(
+                lambda *x: jnp.stack(x),
+                *examples
+            )
+        except ImportError:
+            # 回退到旧版本API
+            from jax import tree_util
+            batched_examples = tree_util.tree_map(
+                lambda *x: jnp.stack(x),
+                *examples
+            )
         
+        # 批量运行推理前清理GPU内存
+        try:
+            import gc
+            import torch
+            gc.collect()
+            torch.cuda.empty_cache()
+            jax.clear_caches()
+        except:
+            pass
+            
         # 批量运行推理
         batch_results = model_runner.run_inference(batched_examples, rng_keys)
         
@@ -473,8 +493,11 @@ def batch_process_seeds(args_batch):
             print(f'Extracting inference results for seed {seed}...')
             extract_start = time.time()
             
-            # 从批处理结果中提取单个结果
-            single_result = jax.tree_map(lambda x: x[i], batch_results)
+            # 从批处理结果中提取单个结果 - 使用新的API
+            try:
+                single_result = tree.map(lambda x: x[i], batch_results)
+            except ImportError:
+                single_result = tree_util.tree_map(lambda x: x[i], batch_results)
             
             inference_results, embeddings = (
                 model_runner.extract_inference_results_and_maybe_embeddings(
@@ -498,8 +521,17 @@ def batch_process_seeds(args_batch):
                 )
             )
             
+            # 每处理完一个结果就清理一次内存
+            try:
+                gc.collect()
+                torch.cuda.empty_cache()
+                jax.clear_caches()
+            except:
+                pass
+            
     except Exception as e:
         print(f'Error in batch processing: {e}')
+        print('Falling back to single sample processing...')
         # 如果批处理失败，回退到逐个处理
         for args in args_batch:
             results.append(process_single_seed(args))
