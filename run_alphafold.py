@@ -428,13 +428,91 @@ def process_single_seed(args):
         embeddings=embeddings,
     )
 
+def batch_process_seeds(args_batch):
+    """批量处理多个种子的推理任务
+    
+    Args:
+        args_batch: list of tuples, each containing (seed, example, model_runner, fold_input)
+        
+    Returns:
+        list of ResultsForSeed objects
+    """
+    results = []
+    batch_size = len(args_batch)
+    
+    # 准备批处理数据
+    seeds = [args[0] for args in args_batch]
+    examples = [args[1] for args in args_batch]
+    model_runner = args_batch[0][2]  # 所有任务使用相同的model_runner
+    fold_input = args_batch[0][3]    # 所有任务使用相同的fold_input
+    
+    print(f'Running batch inference with seeds {seeds}...')
+    inference_start_time = time.time()
+    
+    # 创建批量随机密钥
+    rng_keys = jnp.stack([jax.random.PRNGKey(seed) for seed in seeds])
+    
+    # 批量推理
+    try:
+        # 将examples堆叠成批处理形式
+        batched_examples = jax.tree_map(
+            lambda *x: jnp.stack(x),
+            *examples
+        )
+        
+        # 批量运行推理
+        batch_results = model_runner.run_inference(batched_examples, rng_keys)
+        
+        print(
+            f'Batch inference with {batch_size} seeds took'
+            f' {time.time() - inference_start_time:.2f} seconds.'
+        )
+        
+        # 解包批处理结果
+        for i, (seed, example) in enumerate(zip(seeds, examples)):
+            print(f'Extracting inference results for seed {seed}...')
+            extract_start = time.time()
+            
+            # 从批处理结果中提取单个结果
+            single_result = jax.tree_map(lambda x: x[i], batch_results)
+            
+            inference_results, embeddings = (
+                model_runner.extract_inference_results_and_maybe_embeddings(
+                    batch=example,
+                    result=single_result,
+                    target_name=fold_input.name
+                )
+            )
+            
+            print(
+                f'Extracting {len(inference_results)} inference samples for seed {seed}'
+                f' took {time.time() - extract_start:.2f} seconds.'
+            )
+            
+            results.append(
+                ResultsForSeed(
+                    seed=seed,
+                    inference_results=inference_results,
+                    full_fold_input=fold_input,
+                    embeddings=embeddings,
+                )
+            )
+            
+    except Exception as e:
+        print(f'Error in batch processing: {e}')
+        # 如果批处理失败，回退到逐个处理
+        for args in args_batch:
+            results.append(process_single_seed(args))
+            
+    return results
+
 def predict_structure(
     fold_input: folding_input.Input,
     model_runner: ModelRunner,
     buckets: Sequence[int] | None = None,
     conformer_max_iterations: int | None = None,
 ) -> Sequence[ResultsForSeed]:
-    """使用线程池运行推理流水线来预测每个种子的结构"""
+    """使用批处理和线程池运行推理流水线来预测每个种子的结构"""
 
     print(f'Featurising data with {len(fold_input.rng_seeds)} seed(s)...')
     featurisation_start_time = time.time()
@@ -451,32 +529,77 @@ def predict_structure(
         f' {time.time() - featurisation_start_time:.2f} seconds.'
     )
     
+    # 添加GPU内存监控
+    def get_gpu_memory():
+        try:
+            import nvidia_smi
+            nvidia_smi.nvmlInit()
+            handle = nvidia_smi.nvmlDeviceGetHandleByIndex(0)
+            info = nvidia_smi.nvmlDeviceGetMemoryInfo(handle)
+            return info.used / 1024**2  # 转换为MB
+        except:
+            return 0
+
+    print(f'Current GPU memory usage: {get_gpu_memory():.2f} MB')
+    
     print(
-        'Running parallel model inference and extracting output structure samples with'
+        'Running batch inference and extracting output structure samples with'
         f' {len(fold_input.rng_seeds)} seed(s)...'
     )
     all_inference_start_time = time.time()
     
-    # 准备线程池的参数
+    # 准备批处理参数
     process_args = [
         (seed, example, model_runner, fold_input)
         for seed, example in zip(fold_input.rng_seeds, featurised_examples)
     ]
     
-    # 使用线程池并行处理
+    # 根据序列长度动态调整批处理大小
+    # 对于较长的序列，使用更小的批处理大小
+    seq_length = len(fold_input.chains[0].sequence)  # 获取序列长度
+    if seq_length > 1000:
+        batch_size = 1  # 长序列只能单个处理
+    elif seq_length > 500:
+        batch_size = 2  # 中等长度序列使用较小的批处理大小
+    else:
+        batch_size = 3  # 短序列可以用较大的批处理大小
+        
+    print(f'Using batch size {batch_size} for sequence length {seq_length}')
+    
+    # 将参数分成批次
+    batches = [
+        process_args[i:i + batch_size]
+        for i in range(0, len(process_args), batch_size)
+    ]
+    
+    # 使用线程池处理批次
     from concurrent.futures import ThreadPoolExecutor
-    num_threads = min(len(fold_input.rng_seeds), multiprocessing.cpu_count())
+    # 限制线程数，避免创建过多线程
+    num_threads = min(2, len(batches))
     
+    print(f'Using {num_threads} threads for batch processing')
+    
+    all_results = []
     with ThreadPoolExecutor(max_workers=num_threads) as executor:
-        all_inference_results = list(executor.map(process_single_seed, process_args))
+        try:
+            # 对每个批次运行批处理
+            batch_results = list(executor.map(batch_process_seeds, batches))
+            # 展平结果列表
+            all_results = [result for batch in batch_results for result in batch]
+        except Exception as e:
+            print(f'Batch processing failed: {e}')
+            print('Falling back to single sample processing...')
+            # 如果批处理失败，回退到单个处理
+            all_results = [process_single_seed(args) for args in process_args]
     
+    print(f'Final GPU memory usage: {get_gpu_memory():.2f} MB')
     print(
-        'Running parallel model inference and extracting output structures with'
+        'Running batch inference and extracting output structures with'
         f' {len(fold_input.rng_seeds)} seed(s) took'
         f' {time.time() - all_inference_start_time:.2f} seconds.'
     )
     
-    return all_inference_results
+    return all_results
 
 
 def write_fold_input_json(
