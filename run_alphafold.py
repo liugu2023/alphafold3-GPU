@@ -922,22 +922,6 @@ def run_inference_process(
         raise
 
 def main(_):
-    # 在两个GPU上创建预留进程
-    gpu0_process = multiprocessing.Process(
-        target=create_gpu_process,
-        args=(_MAIN_GPU.value,)
-    )
-    gpu1_process = multiprocessing.Process(
-        target=create_gpu_process,
-        args=(_WORKER_GPU.value,)
-    )
-    
-    gpu0_process.start()
-    gpu1_process.start()
-    
-    # 等待进程创建完成
-    time.sleep(2)
-    
     try:
         # 主进程使用 GPU 0，允许预分配显存以提高性能
         os.environ['CUDA_VISIBLE_DEVICES'] = str(_MAIN_GPU.value)
@@ -1124,12 +1108,9 @@ def main(_):
 
         print(f'All jobs completed successfully')
 
-    finally:
-        # 确保清理预留进程
-        gpu0_process.terminate()
-        gpu1_process.terminate()
-        gpu0_process.join()
-        gpu1_process.join()
+    except Exception as e:
+        print(f"Fatal error during inference: {str(e)}")
+        raise
 
 
 if __name__ == '__main__':
