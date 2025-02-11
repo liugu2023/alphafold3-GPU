@@ -52,7 +52,6 @@ import haiku as hk
 import jax
 from jax import numpy as jnp
 import numpy as np
-import nvidia_smi
 
 
 _HOME_DIR = pathlib.Path(os.environ.get('HOME'))
@@ -213,8 +212,10 @@ _JAX_COMPILATION_CACHE_DIR = flags.DEFINE_string(
 )
 _GPU_DEVICE = flags.DEFINE_integer(
     'gpu_device',
-    -1,
-    '指定用于推理的GPU设备。设置为-1时将自动选择可用显存最多的GPU。在多GPU系统上有用。',
+    0,
+    'Optional override for the GPU device to use for inference. Defaults to the'
+    ' 1st GPU on the system. Useful on multi-GPU systems to pin each run to a'
+    ' specific GPU.',
 )
 _BUCKETS = flags.DEFINE_list(
     'buckets',
@@ -631,25 +632,6 @@ def process_fold_input(
   return output
 
 
-def get_gpu_with_most_memory():
-    """返回可用显存最多的GPU索引"""
-    nvidia_smi.nvmlInit()
-    deviceCount = nvidia_smi.nvmlDeviceGetCount()
-    max_free_memory = 0
-    best_gpu = 0
-    
-    for i in range(deviceCount):
-        handle = nvidia_smi.nvmlDeviceGetHandleByIndex(i)
-        info = nvidia_smi.nvmlDeviceGetMemoryInfo(handle)
-        free_memory = info.free
-        if free_memory > max_free_memory:
-            max_free_memory = free_memory
-            best_gpu = i
-            
-    nvidia_smi.nvmlShutdown()
-    return best_gpu
-
-
 def main(_):
   if _JAX_COMPILATION_CACHE_DIR.value is not None:
     jax.config.update(
@@ -688,41 +670,32 @@ def main(_):
     raise
 
   if _RUN_INFERENCE.value:
-    devices = jax.local_devices(backend='gpu')
-    
-    # 自动选择GPU
-    if _GPU_DEVICE.value == -1:
-        selected_gpu = get_gpu_with_most_memory()
-    else:
-        selected_gpu = _GPU_DEVICE.value
-        
-    print(
-        f'找到本地设备: {devices}, 使用设备 {selected_gpu}:'
-        f' {devices[selected_gpu]}'
-    )
-    
-    # 检查GPU兼容性
-    compute_capability = float(devices[selected_gpu].compute_capability)
-    if compute_capability < 6.0:
+    # Fail early on incompatible devices, but only if we're running inference.
+    gpu_devices = jax.local_devices(backend='gpu')
+    if gpu_devices:
+      compute_capability = float(
+          gpu_devices[_GPU_DEVICE.value].compute_capability
+      )
+      if compute_capability < 6.0:
         raise ValueError(
-            'AlphaFold 3需要至少6.0的GPU计算能力 (参见'
-            ' https://developer.nvidia.com/cuda-gpus)。'
+            'AlphaFold 3 requires at least GPU compute capability 6.0 (see'
+            ' https://developer.nvidia.com/cuda-gpus).'
         )
-    elif 7.0 <= compute_capability < 8.0:
+      elif 7.0 <= compute_capability < 8.0:
         xla_flags = os.environ.get('XLA_FLAGS')
         required_flag = '--xla_disable_hlo_passes=custom-kernel-fusion-rewriter'
         if not xla_flags or required_flag not in xla_flags:
-            raise ValueError(
-                'For devices with GPU compute capability 7.x (see'
-                ' https://developer.nvidia.com/cuda-gpus) the ENV XLA_FLAGS must'
-                f' include "{required_flag}".'
-            )
+          raise ValueError(
+              'For devices with GPU compute capability 7.x (see'
+              ' https://developer.nvidia.com/cuda-gpus) the ENV XLA_FLAGS must'
+              f' include "{required_flag}".'
+          )
         if _FLASH_ATTENTION_IMPLEMENTATION.value != 'xla':
-            raise ValueError(
-                'For devices with GPU compute capability 7.x (see'
-                ' https://developer.nvidia.com/cuda-gpus) the'
-                ' --flash_attention_implementation must be set to "xla".'
-            )
+          raise ValueError(
+              'For devices with GPU compute capability 7.x (see'
+              ' https://developer.nvidia.com/cuda-gpus) the'
+              ' --flash_attention_implementation must be set to "xla".'
+          )
 
   notice = textwrap.wrap(
       'Running AlphaFold 3. Please note that standard AlphaFold 3 model'
@@ -765,7 +738,13 @@ def main(_):
     data_pipeline_config = None
 
   if _RUN_INFERENCE.value:
-    print('从头开始构建模型...')
+    devices = jax.local_devices(backend='gpu')
+    print(
+        f'Found local devices: {devices}, using device {_GPU_DEVICE.value}:'
+        f' {devices[_GPU_DEVICE.value]}'
+    )
+
+    print('Building model from scratch...')
     model_runner = ModelRunner(
         config=make_model_config(
             flash_attention_implementation=typing.cast(
@@ -775,7 +754,7 @@ def main(_):
             num_recycles=_NUM_RECYCLES.value,
             return_embeddings=_SAVE_EMBEDDINGS.value,
         ),
-        device=devices[selected_gpu],  # 使用选定的GPU
+        device=devices[_GPU_DEVICE.value],
         model_dir=pathlib.Path(MODEL_DIR.value),
     )
     # Check we can load the model parameters before launching anything.
