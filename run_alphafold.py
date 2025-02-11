@@ -780,19 +780,20 @@ def run_inference_process(
     model_dir: pathlib.Path,
     gpu_id: int,
 ) -> model.ModelResult:
+    """在指定GPU上运行推理"""
+    # 保存对原始jax模块的引用
+    original_jax = jax
+    
     try:
+        print("\n=== Cleaning up JAX modules ===")
         # 1. 在任何JAX相关操作之前完全清理JAX
         import sys
-        if 'jax' in sys.modules:
-            del sys.modules['jax']
-            del sys.modules['jax._src']
-            del sys.modules['jax.lib']
-            # 清理所有JAX相关模块
-            for k in list(sys.modules.keys()):
-                if k.startswith('jax'):
-                    del sys.modules[k]
+        jax_modules = [k for k in sys.modules if k.startswith('jax')]
+        for k in jax_modules:
+            del sys.modules[k]
         
         # 2. 设置环境变量
+        print(f"\n=== Setting environment variables for GPU {gpu_id} ===")
         os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
         os.environ.update({
             'XLA_PYTHON_CLIENT_MEM_FRACTION': '0.95',
@@ -803,8 +804,12 @@ def run_inference_process(
             'XLA_PYTHON_CLIENT_MEM_LIMIT_MB': '14000',
         })
         
-        # 3. 导入JAX并验证设备
+        # 3. 重新导入JAX
+        print("\n=== Reloading JAX ===")
         import jax
+        import jax.numpy as jnp
+        
+        # 4. 验证设备配置
         print("\n=== JAX Configuration ===")
         print(f"Requested GPU ID: {gpu_id}")
         print(f"CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES')}")
@@ -815,7 +820,8 @@ def run_inference_process(
         if not devices:
             raise RuntimeError(f"No GPU devices found after setting CUDA_VISIBLE_DEVICES={gpu_id}")
         
-        # 4. 创建模型并运行推理
+        # 5. 创建模型并运行推理
+        print(f"\n=== Running inference on GPU {gpu_id} ===")
         with jax.default_device(devices[0]):
             inference_model = ModelRunner(
                 config=model_config,
@@ -830,7 +836,12 @@ def run_inference_process(
         print(f"\n=== Error in Inference Process ===")
         print(f"Error message: {str(e)}")
         print(f"Current CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES')}")
-        print(f"Current JAX devices: {jax.devices()}")
+        try:
+            # 尝试使用当前的JAX实例
+            print(f"Current JAX devices: {jax.devices()}")
+        except:
+            # 如果当前JAX不可用，使用原始JAX实例
+            print(f"Original JAX devices: {original_jax.devices()}")
         raise
 
 def main(_):
