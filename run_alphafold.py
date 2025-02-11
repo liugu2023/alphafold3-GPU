@@ -434,7 +434,7 @@ def predict_structure(
     buckets: Sequence[int] | None = None,
     conformer_max_iterations: int | None = None,
 ) -> Sequence[ResultsForSeed]:
-    """使用多进程运行完整的推理流水线来预测每个种子的结构"""
+    """使用线程池运行推理流水线来预测每个种子的结构"""
 
     print(f'Featurising data with {len(fold_input.rng_seeds)} seed(s)...')
     featurisation_start_time = time.time()
@@ -457,16 +457,18 @@ def predict_structure(
     )
     all_inference_start_time = time.time()
     
-    # 准备进程池的参数
+    # 准备线程池的参数
     process_args = [
         (seed, example, model_runner, fold_input)
         for seed, example in zip(fold_input.rng_seeds, featurised_examples)
     ]
     
-    # 使用进程池并行处理
-    num_processes = min(len(fold_input.rng_seeds), multiprocessing.cpu_count())
-    with multiprocessing.Pool(processes=num_processes) as pool:
-        all_inference_results = pool.map(process_single_seed, process_args)
+    # 使用线程池并行处理
+    from concurrent.futures import ThreadPoolExecutor
+    num_threads = min(len(fold_input.rng_seeds), multiprocessing.cpu_count())
+    
+    with ThreadPoolExecutor(max_workers=num_threads) as executor:
+        all_inference_results = list(executor.map(process_single_seed, process_args))
     
     print(
         'Running parallel model inference and extracting output structures with'
