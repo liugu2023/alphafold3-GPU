@@ -781,51 +781,58 @@ def run_inference_process(
     gpu_id: int,
 ) -> model.ModelResult:
     """在指定GPU上运行推理"""
-    # 保存对原始jax模块的引用
-    original_jax = jax
-    
     try:
-        print("\n=== Cleaning up JAX modules ===")
-        # 1. 在任何JAX相关操作之前完全清理JAX
-        import sys
-        jax_modules = [k for k in sys.modules if k.startswith('jax')]
-        for k in jax_modules:
-            del sys.modules[k]
+        print("\n=== Setting up inference environment ===")
         
-        # 2. 设置环境变量
+        # 1. 删除所有已导入的JAX相关模块
+        import sys
+        for k in list(sys.modules.keys()):
+            if k.startswith('jax') or k.startswith('xla'):
+                del sys.modules[k]
+        
+        # 2. 设置环境变量（在导入JAX之前）
         print(f"\n=== Setting environment variables for GPU {gpu_id} ===")
         os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
-        os.environ.update({
-            'XLA_PYTHON_CLIENT_MEM_FRACTION': '0.95',
-            'XLA_PYTHON_CLIENT_PREALLOCATE': 'true',
-            'XLA_PYTHON_CLIENT_ALLOCATOR': 'platform',
-            'XLA_FORCE_HOST_PLATFORM_DEVICE_COUNT': '1',
-            'TF_FORCE_GPU_ALLOW_GROWTH': 'false',
-            'XLA_PYTHON_CLIENT_MEM_LIMIT_MB': '14000',
-        })
+        os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '0.95'
+        os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'true'
+        os.environ['XLA_PYTHON_CLIENT_ALLOCATOR'] = 'platform'
+        os.environ['XLA_FORCE_HOST_PLATFORM_DEVICE_COUNT'] = '1'
+        os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'false'
+        os.environ['XLA_PYTHON_CLIENT_MEM_LIMIT_MB'] = '14000'
         
-        # 3. 重新导入JAX
-        print("\n=== Reloading JAX ===")
+        # 3. 导入必要的模块
+        print("\n=== Importing JAX in child process ===")
+        import jax.numpy as jnp  # 这会触发JAX的初始化
         import jax
-        import jax.numpy as jnp
         
-        # 4. 验证设备配置
-        print("\n=== JAX Configuration ===")
-        print(f"Requested GPU ID: {gpu_id}")
-        print(f"CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES')}")
-        print(f"JAX backend: {jax.default_backend()}")
-        print(f"All JAX devices: {jax.devices()}")
+        # 4. 验证JAX配置
+        print("\n=== Verifying JAX configuration ===")
+        print(f"Process environment:")
+        print(f"- CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES')}")
+        print(f"- XLA_PYTHON_CLIENT_MEM_FRACTION: {os.environ.get('XLA_PYTHON_CLIENT_MEM_FRACTION')}")
         
+        print("\nJAX configuration:")
+        print(f"- Backend: {jax.default_backend()}")
+        print(f"- Available devices: {jax.devices()}")
+        print(f"- Default device: {jax.default_device()}")
+        
+        # 5. 获取GPU设备
         devices = jax.devices('gpu')
         if not devices:
-            raise RuntimeError(f"No GPU devices found after setting CUDA_VISIBLE_DEVICES={gpu_id}")
+            raise RuntimeError(f"No GPU devices found in child process. CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES')}")
         
-        # 5. 创建模型并运行推理
+        device = devices[0]
+        print(f"\nUsing device: {device}")
+        print(f"- Platform: {device.platform}")
+        print(f"- Device kind: {device.device_kind}")
+        print(f"- Device ID: {device.id}")
+        
+        # 6. 运行推理
         print(f"\n=== Running inference on GPU {gpu_id} ===")
-        with jax.default_device(devices[0]):
+        with jax.default_device(device):
             inference_model = ModelRunner(
                 config=model_config,
-                device=devices[0],
+                device=device,
                 model_dir=model_dir
             )
             result = inference_model.run_inference(featurised_example, rng_key)
@@ -833,15 +840,12 @@ def run_inference_process(
         return result
         
     except Exception as e:
-        print(f"\n=== Error in Inference Process ===")
+        print(f"\n=== Error in inference process ===")
         print(f"Error message: {str(e)}")
-        print(f"Current CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES')}")
-        try:
-            # 尝试使用当前的JAX实例
-            print(f"Current JAX devices: {jax.devices()}")
-        except:
-            # 如果当前JAX不可用，使用原始JAX实例
-            print(f"Original JAX devices: {original_jax.devices()}")
+        print(f"Environment state:")
+        print(f"- CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES')}")
+        print(f"- Current working directory: {os.getcwd()}")
+        print(f"- Python path: {sys.path}")
         raise
 
 def main(_):
