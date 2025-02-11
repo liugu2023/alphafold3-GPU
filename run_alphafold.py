@@ -780,9 +780,19 @@ def run_inference_process(
     model_dir: pathlib.Path,
     gpu_id: int,
 ) -> model.ModelResult:
-    """在指定GPU上运行推理"""
     try:
-        # 1. 在导入或使用JAX之前设置环境变量
+        # 1. 在任何JAX相关操作之前完全清理JAX
+        import sys
+        if 'jax' in sys.modules:
+            del sys.modules['jax']
+            del sys.modules['jax._src']
+            del sys.modules['jax.lib']
+            # 清理所有JAX相关模块
+            for k in list(sys.modules.keys()):
+                if k.startswith('jax'):
+                    del sys.modules[k]
+        
+        # 2. 设置环境变量
         os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
         os.environ.update({
             'XLA_PYTHON_CLIENT_MEM_FRACTION': '0.95',
@@ -793,36 +803,19 @@ def run_inference_process(
             'XLA_PYTHON_CLIENT_MEM_LIMIT_MB': '14000',
         })
         
-        # 2. 重新导入JAX以确保它看到新的环境变量
-        import sys
-        if 'jax' in sys.modules:
-            del sys.modules['jax']
-            del sys.modules['jax._src']
+        # 3. 导入JAX并验证设备
         import jax
-        
-        print("\n=== Inference Process Device Information ===")
-        print(f"Requested GPU ID: {gpu_id}")
-        print(f"CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES', 'Not set')}")
-        
-        # 3. 验证JAX设备并输出详细信息
         print("\n=== JAX Configuration ===")
+        print(f"Requested GPU ID: {gpu_id}")
+        print(f"CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES')}")
         print(f"JAX backend: {jax.default_backend()}")
         print(f"All JAX devices: {jax.devices()}")
-        print(f"Default JAX device: {jax.default_device()}")
         
         devices = jax.devices('gpu')
         if not devices:
-            raise RuntimeError("No GPU devices found")
+            raise RuntimeError(f"No GPU devices found after setting CUDA_VISIBLE_DEVICES={gpu_id}")
         
-        print("\n=== Available GPU Devices to JAX ===")
-        for device in devices:
-            print(f"  - Device: {device}")
-            print(f"    Platform: {device.platform}")
-            print(f"    Device kind: {device.device_kind}")
-            print(f"    Device ID: {device.id}")
-            
-        # 4. 创建模型实例并运行推理
-        print(f"\n=== Creating Model on Device {devices[0]} ===")
+        # 4. 创建模型并运行推理
         with jax.default_device(devices[0]):
             inference_model = ModelRunner(
                 config=model_config,
@@ -831,20 +824,13 @@ def run_inference_process(
             )
             result = inference_model.run_inference(featurised_example, rng_key)
         
-        # 5. 确保结果在CPU上
-        result = jax.tree_util.tree_map(
-            lambda x: np.array(x) if isinstance(x, (np.ndarray, jnp.ndarray)) else x,
-            result
-        )
-        
         return result
         
     except Exception as e:
         print(f"\n=== Error in Inference Process ===")
         print(f"Error message: {str(e)}")
-        print(f"Current CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES', 'Not set')}")
+        print(f"Current CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES')}")
         print(f"Current JAX devices: {jax.devices()}")
-        print(f"Current JAX backend: {jax.default_backend()}")
         raise
 
 def main(_):
