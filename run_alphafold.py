@@ -33,6 +33,9 @@ import textwrap
 import time
 import typing
 from typing import overload
+import hashlib
+import pickle
+from functools import lru_cache
 
 from absl import app
 from absl import flags
@@ -538,47 +541,103 @@ def batch_process_seeds(args_batch):
             
     return results
 
-def predict_structure(
-    fold_input: folding_input.Input,
-    model_runner: ModelRunner,
-    buckets: Sequence[int] | None = None,
-    conformer_max_iterations: int | None = None,
-) -> Sequence[ResultsForSeed]:
-    """使用批处理和线程池运行推理流水线来预测每个种子的结构"""
+def get_cache_dir():
+    """获取缓存目录"""
+    cache_dir = pathlib.Path.home() / '.alphafold_cache'
+    cache_dir.mkdir(exist_ok=True)
+    return cache_dir
 
-    print(f'Featurising data with {len(fold_input.rng_seeds)} seed(s)...')
-    featurisation_start_time = time.time()
-    ccd = chemical_components.cached_ccd(user_ccd=fold_input.user_ccd)
-    featurised_examples = featurisation.featurise_input(
+def compute_input_hash(fold_input: folding_input.Input) -> str:
+    """计算输入数据的哈希值作为缓存键"""
+    input_json = fold_input.to_json()
+    return hashlib.md5(input_json.encode()).hexdigest()
+
+@lru_cache(maxsize=128)
+def cached_featurisation(input_hash: str, fold_input, buckets, ccd, conformer_max_iterations):
+    """使用内存缓存的特征化计算"""
+    return featurisation.featurise_input(
         fold_input=fold_input,
         buckets=buckets,
         ccd=ccd,
         verbose=True,
         conformer_max_iterations=conformer_max_iterations,
     )
-    print(
-        f'Featurising data with {len(fold_input.rng_seeds)} seed(s) took'
-        f' {time.time() - featurisation_start_time:.2f} seconds.'
-    )
+
+def save_cache(cache_key: str, data, cache_type: str):
+    """保存数据到磁盘缓存"""
+    cache_dir = get_cache_dir() / cache_type
+    cache_dir.mkdir(exist_ok=True)
+    cache_file = cache_dir / f"{cache_key}.pkl"
     
-    # 添加GPU内存监控
+    try:
+        with cache_file.open('wb') as f:
+            pickle.dump(data, f)
+    except Exception as e:
+        print(f"Warning: Failed to save cache: {e}")
+
+def load_cache(cache_key: str, cache_type: str):
+    """从磁盘缓存加载数据"""
+    cache_file = get_cache_dir() / cache_type / f"{cache_key}.pkl"
+    
+    if cache_file.exists():
+        try:
+            with cache_file.open('rb') as f:
+                return pickle.load(f)
+        except Exception as e:
+            print(f"Warning: Failed to load cache: {e}")
+    return None
+
+def predict_structure(
+    fold_input: folding_input.Input,
+    model_runner: ModelRunner,
+    buckets: Sequence[int] | None = None,
+    conformer_max_iterations: int | None = None,
+) -> Sequence[ResultsForSeed]:
+    """使用缓存机制和批处理运行推理流水线来预测每个种子的结构"""
+
+    # 计算输入的哈希值作为缓存键
+    input_hash = compute_input_hash(fold_input)
+    
+    # 尝试从缓存加载特征化结果
+    print("Checking featurisation cache...")
+    featurised_examples = load_cache(input_hash, 'featurisation')
+    
+    if featurised_examples is None:
+        print(f'Featurising data with {len(fold_input.rng_seeds)} seed(s)...')
+        featurisation_start_time = time.time()
+        ccd = chemical_components.cached_ccd(user_ccd=fold_input.user_ccd)
+        
+        # 使用内存缓存的特征化
+        featurised_examples = cached_featurisation(
+            input_hash,
+            fold_input,
+            buckets,
+            ccd,
+            conformer_max_iterations
+        )
+        
+        print(
+            f'Featurising data with {len(fold_input.rng_seeds)} seed(s) took'
+            f' {time.time() - featurisation_start_time:.2f} seconds.'
+        )
+        
+        # 保存特征化结果到磁盘缓存
+        save_cache(input_hash, featurised_examples, 'featurisation')
+    else:
+        print("Loaded featurised examples from cache")
+    
+    # GPU内存监控和批处理逻辑
     def get_gpu_memory():
         try:
             import nvidia_smi
             nvidia_smi.nvmlInit()
             handle = nvidia_smi.nvmlDeviceGetHandleByIndex(0)
             info = nvidia_smi.nvmlDeviceGetMemoryInfo(handle)
-            return info.used / 1024**2  # 转换为MB
+            return info.used / 1024**2
         except:
             return 0
 
     print(f'Current GPU memory usage: {get_gpu_memory():.2f} MB')
-    
-    print(
-        'Running batch inference and extracting output structure samples with'
-        f' {len(fold_input.rng_seeds)} seed(s)...'
-    )
-    all_inference_start_time = time.time()
     
     # 准备批处理参数
     process_args = [
@@ -586,50 +645,38 @@ def predict_structure(
         for seed, example in zip(fold_input.rng_seeds, featurised_examples)
     ]
     
-    # 根据序列长度动态调整批处理大小
-    # 对于较长的序列，使用更小的批处理大小
-    seq_length = len(fold_input.chains[0].sequence)  # 获取序列长度
+    # 动态批处理大小设置
+    seq_length = len(fold_input.chains[0].sequence)
     if seq_length > 1000:
-        batch_size = 1  # 长序列只能单个处理
+        batch_size = 1
     elif seq_length > 500:
-        batch_size = 2  # 中等长度序列使用较小的批处理大小
+        batch_size = 2
     else:
-        batch_size = 3  # 短序列可以用较大的批处理大小
+        batch_size = 3
         
     print(f'Using batch size {batch_size} for sequence length {seq_length}')
     
-    # 将参数分成批次
+    # 批处理和线程池逻辑
     batches = [
         process_args[i:i + batch_size]
         for i in range(0, len(process_args), batch_size)
     ]
     
-    # 使用线程池处理批次
     from concurrent.futures import ThreadPoolExecutor
-    # 限制线程数，避免创建过多线程
     num_threads = min(2, len(batches))
-    
     print(f'Using {num_threads} threads for batch processing')
     
     all_results = []
     with ThreadPoolExecutor(max_workers=num_threads) as executor:
         try:
-            # 对每个批次运行批处理
             batch_results = list(executor.map(batch_process_seeds, batches))
-            # 展平结果列表
             all_results = [result for batch in batch_results for result in batch]
         except Exception as e:
             print(f'Batch processing failed: {e}')
             print('Falling back to single sample processing...')
-            # 如果批处理失败，回退到单个处理
             all_results = [process_single_seed(args) for args in process_args]
     
     print(f'Final GPU memory usage: {get_gpu_memory():.2f} MB')
-    print(
-        'Running batch inference and extracting output structures with'
-        f' {len(fold_input.rng_seeds)} seed(s) took'
-        f' {time.time() - all_inference_start_time:.2f} seconds.'
-    )
     
     return all_results
 
