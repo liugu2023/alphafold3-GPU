@@ -802,12 +802,15 @@ class FeatureCache:
 
 
 def optimize_features(
-    featurised_example: features.BatchDict,
+    featurised_example: features.BatchDict | list,
     dtype: jnp.dtype = jnp.float32
 ) -> features.BatchDict:
     """优化特征数据类型和内存布局."""
+    # 如果输入是列表，取第一个元素
+    if isinstance(featurised_example, list):
+        featurised_example = featurised_example[0]
+        
     optimized = {}
-    
     for key, value in featurised_example.items():
         if isinstance(value, np.ndarray):
             # 优化数据类型
@@ -824,9 +827,13 @@ def optimize_features(
 
 
 def validate_features(
-    featurised_example: features.BatchDict
+    featurised_example: features.BatchDict | list
 ) -> None:
     """验证特征的完整性和正确性."""
+    # 如果输入是列表，取第一个元素
+    if isinstance(featurised_example, list):
+        featurised_example = featurised_example[0]
+        
     required_features = {
         'aatype', 'residue_index', 'seq_length',
         'template_aatype', 'template_all_atom_positions'
@@ -849,12 +856,15 @@ def validate_features(
 
 
 def compress_features(
-    featurised_example: features.BatchDict,
+    featurised_example: features.BatchDict | list,
     compression_level: int = 1
 ) -> features.BatchDict:
     """压缩特征以减少内存使用."""
+    # 如果输入是列表，取第一个元素
+    if isinstance(featurised_example, list):
+        featurised_example = featurised_example[0]
+        
     compressed = {}
-    
     for key, value in featurised_example.items():
         if isinstance(value, np.ndarray):
             # 对精度要求不高的特征进行降精度
