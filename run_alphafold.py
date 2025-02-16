@@ -32,8 +32,7 @@ import string
 import textwrap
 import time
 import typing
-from typing import overload
-import hashlib
+from typing import overload, Optional
 
 from absl import app
 from absl import flags
@@ -53,6 +52,7 @@ import haiku as hk
 import jax
 from jax import numpy as jnp
 import numpy as np
+import jax.profiler
 
 
 _HOME_DIR = pathlib.Path(os.environ.get('HOME'))
@@ -272,33 +272,6 @@ _SAVE_EMBEDDINGS = flags.DEFINE_bool(
     'Whether to save the final trunk single and pair embeddings in the output.',
 )
 
-# 添加新的配置选项
-_JAX_CACHE_SIZE = flags.DEFINE_integer(
-    'jax_cache_size',
-    5000,  # 默认缓存5000个编译结果
-    '设置JAX编译缓存大小(MB)',
-)
-
-_JAX_CACHE_EVICTION = flags.DEFINE_enum(
-    'jax_cache_eviction',
-    default='lru',
-    enum_values=['lru', 'fifo'],
-    help='JAX缓存淘汰策略'
-)
-
-# 添加新的配置选项
-_FEATURE_CACHE_DIR = flags.DEFINE_string(
-    'feature_cache_dir',
-    None,
-    '特征缓存目录路径'
-)
-
-_NUM_FEATURE_WORKERS = flags.DEFINE_integer(
-    'num_feature_workers',
-    None,
-    '特征化并行处理的worker数量'
-)
-
 
 def make_model_config(
     *,
@@ -306,111 +279,177 @@ def make_model_config(
     num_diffusion_samples: int = 5,
     num_recycles: int = 10,
     return_embeddings: bool = False,
+    enable_compile_monitoring: bool = True,
 ) -> model.Model.Config:
-  """Returns a model config with some defaults overridden."""
-  config = model.Model.Config()
-  config.global_config.flash_attention_implementation = (
-      flash_attention_implementation
-  )
-  config.heads.diffusion.eval.num_samples = num_diffusion_samples
-  config.num_recycles = num_recycles
-  config.return_embeddings = return_embeddings
-  return config
+    """Returns a model config with compilation monitoring."""
+    config = model.Model.Config()
+    config.global_config.flash_attention_implementation = flash_attention_implementation
+    config.heads.diffusion.eval.num_samples = num_diffusion_samples
+    config.num_recycles = num_recycles
+    config.return_embeddings = return_embeddings
+    
+    if enable_compile_monitoring:
+        # 添加编译进度监控
+        config.global_config.enable_jax_profiler = True
+    
+    return config
 
 
 class ModelRunner:
-  """Helper class to run structure prediction stages."""
+    def __init__(
+        self,
+        config: model.Model.Config,
+        device: jax.Device,
+        model_dir: pathlib.Path,
+        bucket_sizes: Optional[Sequence[int]] = None,
+    ):
+        self._model_config = config
+        self._device = device
+        self._model_dir = model_dir
+        self._bucket_sizes = bucket_sizes or []
+        
+        # 设置JAX编译缓存
+        if _JAX_COMPILATION_CACHE_DIR.value:
+            os.makedirs(_JAX_COMPILATION_CACHE_DIR.value, exist_ok=True)
+            jax.config.update('jax_compilation_cache_dir', _JAX_COMPILATION_CACHE_DIR.value)
+            
+        # 启用编译进度监控
+        if config.global_config.enable_jax_profiler:
+            jax.profiler.start_trace()
 
-  def __init__(
-      self,
-      config: model.Model.Config,
-      device: jax.Device,
-      model_dir: pathlib.Path,
-  ):
-    self._model_config = config
-    self._device = device
-    self._model_dir = model_dir
+    def _get_optimal_bucket_size(self, num_tokens: int) -> int:
+        """根据输入token数选择最优bucket size."""
+        if not self._bucket_sizes:
+            return num_tokens
+            
+        for bucket_size in self._bucket_sizes:
+            if num_tokens <= bucket_size:
+                return bucket_size
+                
+        return num_tokens
 
-  @functools.cached_property
-  def model_params(self) -> hk.Params:
-    """Loads model parameters from the model directory."""
-    return params.get_model_haiku_params(model_dir=self._model_dir)
+    @functools.cached_property 
+    def model_params(self) -> hk.Params:
+        """缓存模型参数加载."""
+        return params.get_model_haiku_params(model_dir=self._model_dir)
 
-  @functools.cached_property
-  def _model(
-      self,
-  ) -> Callable[[jnp.ndarray, features.BatchDict], model.ModelResult]:
-    """Loads model parameters and returns a jitted model forward pass."""
+    @functools.cached_property
+    def _model(
+        self,
+    ) -> Callable[[jnp.ndarray, features.BatchDict], model.ModelResult]:
+        """Loads model parameters and returns a jitted model forward pass."""
 
-    @hk.transform
-    def forward_fn(batch):
-      return model.Model(self._model_config)(batch)
+        @hk.transform
+        def forward_fn(batch):
+            return model.Model(self._model_config)(batch)
 
-    return functools.partial(
-        jax.jit(forward_fn.apply, device=self._device), self.model_params
-    )
-
-  def run_inference(
-      self, featurised_example: features.BatchDict, rng_key: jnp.ndarray
-  ) -> model.ModelResult:
-    """Computes a forward pass of the model on a featurised example."""
-    featurised_example = jax.device_put(
-        jax.tree_util.tree_map(
-            jnp.asarray, utils.remove_invalidly_typed_feats(featurised_example)
-        ),
-        self._device,
-    )
-
-    result = self._model(rng_key, featurised_example)
-    result = jax.tree.map(np.asarray, result)
-    result = jax.tree.map(
-        lambda x: x.astype(jnp.float32) if x.dtype == jnp.bfloat16 else x,
-        result,
-    )
-    result = dict(result)
-    identifier = self.model_params['__meta__']['__identifier__'].tobytes()
-    result['__identifier__'] = identifier
-    return result
-
-  def extract_inference_results_and_maybe_embeddings(
-      self,
-      batch: features.BatchDict,
-      result: model.ModelResult,
-      target_name: str,
-  ) -> tuple[list[model.InferenceResult], dict[str, np.ndarray] | None]:
-    """Extracts inference results and embeddings (if set) from model outputs."""
-    inference_results = list(
-        model.Model.get_inference_result(
-            batch=batch, result=result, target_name=target_name
+        return functools.partial(
+            jax.jit(forward_fn.apply, device=self._device), self.model_params
         )
-    )
-    num_tokens = len(inference_results[0].metadata['token_chain_ids'])
-    embeddings = {}
-    if 'single_embeddings' in result:
-      embeddings['single_embeddings'] = result['single_embeddings'][:num_tokens]
-    if 'pair_embeddings' in result:
-      embeddings['pair_embeddings'] = result['pair_embeddings'][
-          :num_tokens, :num_tokens
-      ]
-    return inference_results, embeddings or None
+
+    def run_inference(
+        self, 
+        featurised_example: features.BatchDict,
+        rng_key: jnp.ndarray
+    ) -> model.ModelResult:
+        """优化后的模型推理."""
+        # 获取token数并选择bucket
+        num_tokens = len(featurised_example['token_chain_ids'])
+        bucket_size = self._get_optimal_bucket_size(num_tokens)
+        
+        # 根据bucket size填充输入
+        if bucket_size > num_tokens:
+            featurised_example = self._pad_to_bucket_size(
+                featurised_example, 
+                bucket_size
+            )
+            
+        # 转移数据到设备
+        featurised_example = jax.device_put(
+            jax.tree_util.tree_map(
+                jnp.asarray,
+                utils.remove_invalidly_typed_feats(featurised_example)
+            ),
+            self._device,
+        )
+
+        # 执行推理
+        result = self._model(rng_key, featurised_example)
+        
+        # 移除padding并转换结果
+        if bucket_size > num_tokens:
+            result = self._remove_padding(result, num_tokens)
+            
+        result = jax.tree.map(np.asarray, result)
+        result = jax.tree.map(
+            lambda x: x.astype(jnp.float32) if x.dtype == jnp.bfloat16 else x,
+            result,
+        )
+        
+        # 添加模型标识
+        result = dict(result)
+        identifier = self.model_params['__meta__']['__identifier__'].tobytes()
+        result['__identifier__'] = identifier
+        
+        return result
+
+    def _pad_to_bucket_size(
+        self,
+        example: features.BatchDict,
+        bucket_size: int
+    ) -> features.BatchDict:
+        """将输入填充到bucket size."""
+        # 实现填充逻辑
+        return example  # TODO: 实现实际的填充逻辑
+
+    def _remove_padding(
+        self,
+        result: model.ModelResult,
+        original_size: int
+    ) -> model.ModelResult:
+        """移除结果中的padding."""
+        # 实现padding移除逻辑  
+        return result  # TODO: 实现实际的padding移除逻辑
+
+    def extract_inference_results_and_maybe_embeddings(
+        self,
+        batch: features.BatchDict,
+        result: model.ModelResult,
+        target_name: str,
+    ) -> tuple[list[model.InferenceResult], dict[str, np.ndarray] | None]:
+        """Extracts inference results and embeddings (if set) from model outputs."""
+        inference_results = list(
+            model.Model.get_inference_result(
+                batch=batch, result=result, target_name=target_name
+            )
+        )
+        num_tokens = len(inference_results[0].metadata['token_chain_ids'])
+        embeddings = {}
+        if 'single_embeddings' in result:
+            embeddings['single_embeddings'] = result['single_embeddings'][:num_tokens]
+        if 'pair_embeddings' in result:
+            embeddings['pair_embeddings'] = result['pair_embeddings'][
+                :num_tokens, :num_tokens
+            ]
+        return inference_results, embeddings or None
 
 
 @dataclasses.dataclass(frozen=True, slots=True, kw_only=True)
 class ResultsForSeed:
-  """Stores the inference results (diffusion samples) for a single seed.
+    """Stores the inference results (diffusion samples) for a single seed.
 
-  Attributes:
-    seed: The seed used to generate the samples.
-    inference_results: The inference results, one per sample.
-    full_fold_input: The fold input that must also include the results of
-      running the data pipeline - MSA and templates.
-    embeddings: The final trunk single and pair embeddings, if requested.
-  """
+    Attributes:
+        seed: The seed used to generate the samples.
+        inference_results: The inference results, one per sample.
+        full_fold_input: The fold input that must also include the results of
+            running the data pipeline - MSA and templates.
+        embeddings: The final trunk single and pair embeddings, if requested.
+    """
 
-  seed: int
-  inference_results: Sequence[model.InferenceResult]
-  full_fold_input: folding_input.Input
-  embeddings: dict[str, np.ndarray] | None = None
+    seed: int
+    inference_results: Sequence[model.InferenceResult]
+    full_fold_input: folding_input.Input
+    embeddings: dict[str, np.ndarray] | None = None
 
 
 def predict_structure(
@@ -419,75 +458,75 @@ def predict_structure(
     buckets: Sequence[int] | None = None,
     conformer_max_iterations: int | None = None,
 ) -> Sequence[ResultsForSeed]:
-  """Runs the full inference pipeline to predict structures for each seed."""
+    """Runs the full inference pipeline to predict structures for each seed."""
 
-  print(f'Featurising data with {len(fold_input.rng_seeds)} seed(s)...')
-  featurisation_start_time = time.time()
-  ccd = chemical_components.cached_ccd(user_ccd=fold_input.user_ccd)
-  featurised_examples = featurisation.featurise_input(
-      fold_input=fold_input,
-      buckets=buckets,
-      ccd=ccd,
-      verbose=True,
-      conformer_max_iterations=conformer_max_iterations,
-  )
-  print(
-      f'Featurising data with {len(fold_input.rng_seeds)} seed(s) took'
-      f' {time.time() - featurisation_start_time:.2f} seconds.'
-  )
-  print(
-      'Running model inference and extracting output structure samples with'
-      f' {len(fold_input.rng_seeds)} seed(s)...'
-  )
-  all_inference_start_time = time.time()
-  all_inference_results = []
-  for seed, example in zip(fold_input.rng_seeds, featurised_examples):
-    print(f'Running model inference with seed {seed}...')
-    inference_start_time = time.time()
-    rng_key = jax.random.PRNGKey(seed)
-    result = model_runner.run_inference(example, rng_key)
-    print(
-        f'Running model inference with seed {seed} took'
-        f' {time.time() - inference_start_time:.2f} seconds.'
-    )
-    print(f'Extracting inference results with seed {seed}...')
-    extract_structures = time.time()
-    inference_results, embeddings = (
-        model_runner.extract_inference_results_and_maybe_embeddings(
-            batch=example, result=result, target_name=fold_input.name
-        )
+    print(f'Featurising data with {len(fold_input.rng_seeds)} seed(s)...')
+    featurisation_start_time = time.time()
+    ccd = chemical_components.cached_ccd(user_ccd=fold_input.user_ccd)
+    featurised_examples = featurisation.featurise_input(
+        fold_input=fold_input,
+        buckets=buckets,
+        ccd=ccd,
+        verbose=True,
+        conformer_max_iterations=conformer_max_iterations,
     )
     print(
-        f'Extracting {len(inference_results)} inference samples with'
-        f' seed {seed} took {time.time() - extract_structures:.2f} seconds.'
+        f'Featurising data with {len(fold_input.rng_seeds)} seed(s) took'
+        f' {time.time() - featurisation_start_time:.2f} seconds.'
     )
-
-    all_inference_results.append(
-        ResultsForSeed(
-            seed=seed,
-            inference_results=inference_results,
-            full_fold_input=fold_input,
-            embeddings=embeddings,
+    print(
+        'Running model inference and extracting output structure samples with'
+        f' {len(fold_input.rng_seeds)} seed(s)...'
+    )
+    all_inference_start_time = time.time()
+    all_inference_results = []
+    for seed, example in zip(fold_input.rng_seeds, featurised_examples):
+        print(f'Running model inference with seed {seed}...')
+        inference_start_time = time.time()
+        rng_key = jax.random.PRNGKey(seed)
+        result = model_runner.run_inference(example, rng_key)
+        print(
+            f'Running model inference with seed {seed} took'
+            f' {time.time() - inference_start_time:.2f} seconds.'
         )
+        print(f'Extracting inference results with seed {seed}...')
+        extract_structures = time.time()
+        inference_results, embeddings = (
+            model_runner.extract_inference_results_and_maybe_embeddings(
+                batch=example, result=result, target_name=fold_input.name
+            )
+        )
+        print(
+            f'Extracting {len(inference_results)} inference samples with'
+            f' seed {seed} took {time.time() - extract_structures:.2f} seconds.'
+        )
+
+        all_inference_results.append(
+            ResultsForSeed(
+                seed=seed,
+                inference_results=inference_results,
+                full_fold_input=fold_input,
+                embeddings=embeddings,
+            )
+        )
+    print(
+        'Running model inference and extracting output structures with'
+        f' {len(fold_input.rng_seeds)} seed(s) took'
+        f' {time.time() - all_inference_start_time:.2f} seconds.'
     )
-  print(
-      'Running model inference and extracting output structures with'
-      f' {len(fold_input.rng_seeds)} seed(s) took'
-      f' {time.time() - all_inference_start_time:.2f} seconds.'
-  )
-  return all_inference_results
+    return all_inference_results
 
 
 def write_fold_input_json(
     fold_input: folding_input.Input,
     output_dir: os.PathLike[str] | str,
 ) -> None:
-  """Writes the input JSON to the output directory."""
-  os.makedirs(output_dir, exist_ok=True)
-  path = os.path.join(output_dir, f'{fold_input.sanitised_name()}_data.json')
-  print(f'Writing model input JSON to {path}')
-  with open(path, 'wt') as f:
-    f.write(fold_input.to_json())
+    """Writes the input JSON to the output directory."""
+    os.makedirs(output_dir, exist_ok=True)
+    path = os.path.join(output_dir, f'{fold_input.sanitised_name()}_data.json')
+    print(f'Writing model input JSON to {path}')
+    with open(path, 'wt') as f:
+        f.write(fold_input.to_json())
 
 
 def write_outputs(
@@ -495,51 +534,51 @@ def write_outputs(
     output_dir: os.PathLike[str] | str,
     job_name: str,
 ) -> None:
-  """Writes outputs to the specified output directory."""
-  ranking_scores = []
-  max_ranking_score = None
-  max_ranking_result = None
+    """Writes outputs to the specified output directory."""
+    ranking_scores = []
+    max_ranking_score = None
+    max_ranking_result = None
 
-  output_terms = (
-      pathlib.Path(alphafold3.cpp.__file__).parent / 'OUTPUT_TERMS_OF_USE.md'
-  ).read_text()
+    output_terms = (
+        pathlib.Path(alphafold3.cpp.__file__).parent / 'OUTPUT_TERMS_OF_USE.md'
+    ).read_text()
 
-  os.makedirs(output_dir, exist_ok=True)
-  for results_for_seed in all_inference_results:
-    seed = results_for_seed.seed
-    for sample_idx, result in enumerate(results_for_seed.inference_results):
-      sample_dir = os.path.join(output_dir, f'seed-{seed}_sample-{sample_idx}')
-      os.makedirs(sample_dir, exist_ok=True)
-      post_processing.write_output(
-          inference_result=result, output_dir=sample_dir
-      )
-      ranking_score = float(result.metadata['ranking_score'])
-      ranking_scores.append((seed, sample_idx, ranking_score))
-      if max_ranking_score is None or ranking_score > max_ranking_score:
-        max_ranking_score = ranking_score
-        max_ranking_result = result
+    os.makedirs(output_dir, exist_ok=True)
+    for results_for_seed in all_inference_results:
+        seed = results_for_seed.seed
+        for sample_idx, result in enumerate(results_for_seed.inference_results):
+            sample_dir = os.path.join(output_dir, f'seed-{seed}_sample-{sample_idx}')
+            os.makedirs(sample_dir, exist_ok=True)
+            post_processing.write_output(
+                inference_result=result, output_dir=sample_dir
+            )
+            ranking_score = float(result.metadata['ranking_score'])
+            ranking_scores.append((seed, sample_idx, ranking_score))
+            if max_ranking_score is None or ranking_score > max_ranking_score:
+                max_ranking_score = ranking_score
+                max_ranking_result = result
 
-    if embeddings := results_for_seed.embeddings:
-      embeddings_dir = os.path.join(output_dir, f'seed-{seed}_embeddings')
-      os.makedirs(embeddings_dir, exist_ok=True)
-      post_processing.write_embeddings(
-          embeddings=embeddings, output_dir=embeddings_dir
-      )
+        if embeddings := results_for_seed.embeddings:
+            embeddings_dir = os.path.join(output_dir, f'seed-{seed}_embeddings')
+            os.makedirs(embeddings_dir, exist_ok=True)
+            post_processing.write_embeddings(
+                embeddings=embeddings, output_dir=embeddings_dir
+            )
 
-  if max_ranking_result is not None:  # True iff ranking_scores non-empty.
-    post_processing.write_output(
-        inference_result=max_ranking_result,
-        output_dir=output_dir,
-        # The output terms of use are the same for all seeds/samples.
-        terms_of_use=output_terms,
-        name=job_name,
-    )
-    # Save csv of ranking scores with seeds and sample indices, to allow easier
-    # comparison of ranking scores across different runs.
-    with open(os.path.join(output_dir, 'ranking_scores.csv'), 'wt') as f:
-      writer = csv.writer(f)
-      writer.writerow(['seed', 'sample', 'ranking_score'])
-      writer.writerows(ranking_scores)
+    if max_ranking_result is not None:  # True iff ranking_scores non-empty.
+        post_processing.write_output(
+            inference_result=max_ranking_result,
+            output_dir=output_dir,
+            # The output terms of use are the same for all seeds/samples.
+            terms_of_use=output_terms,
+            name=job_name,
+        )
+        # Save csv of ranking scores with seeds and sample indices, to allow easier
+        # comparison of ranking scores across different runs.
+        with open(os.path.join(output_dir, 'ranking_scores.csv'), 'wt') as f:
+            writer = csv.writer(f)
+            writer.writerow(['seed', 'sample', 'ranking_score'])
+            writer.writerows(ranking_scores)
 
 
 @overload
@@ -550,7 +589,7 @@ def process_fold_input(
     output_dir: os.PathLike[str] | str,
     buckets: Sequence[int] | None = None,
 ) -> folding_input.Input:
-  ...
+    ...
 
 
 @overload
@@ -561,23 +600,23 @@ def process_fold_input(
     output_dir: os.PathLike[str] | str,
     buckets: Sequence[int] | None = None,
 ) -> Sequence[ResultsForSeed]:
-  ...
+    ...
 
 
 def replace_db_dir(path_with_db_dir: str, db_dirs: Sequence[str]) -> str:
-  """Replaces the DB_DIR placeholder in a path with the given DB_DIR."""
-  template = string.Template(path_with_db_dir)
-  if 'DB_DIR' in template.get_identifiers():
-    for db_dir in db_dirs:
-      path = template.substitute(DB_DIR=db_dir)
-      if os.path.exists(path):
-        return path
-    raise FileNotFoundError(
-        f'{path_with_db_dir} with ${{DB_DIR}} not found in any of {db_dirs}.'
-    )
-  if not os.path.exists(path_with_db_dir):
-    raise FileNotFoundError(f'{path_with_db_dir} does not exist.')
-  return path_with_db_dir
+    """Replaces the DB_DIR placeholder in a path with the given DB_DIR."""
+    template = string.Template(path_with_db_dir)
+    if 'DB_DIR' in template.get_identifiers():
+        for db_dir in db_dirs:
+            path = template.substitute(DB_DIR=db_dir)
+            if os.path.exists(path):
+                return path
+        raise FileNotFoundError(
+            f'{path_with_db_dir} with ${{DB_DIR}} not found in any of {db_dirs}.'
+        )
+    if not os.path.exists(path_with_db_dir):
+        raise FileNotFoundError(f'{path_with_db_dir} does not exist.')
+    return path_with_db_dir
 
 
 def process_fold_input(
@@ -588,39 +627,50 @@ def process_fold_input(
     buckets: Sequence[int] | None = None,
     conformer_max_iterations: int | None = None,
 ) -> folding_input.Input | Sequence[ResultsForSeed]:
-    """处理单个fold输入"""
+    """Runs data pipeline and/or inference on a single fold input.
+
+    Args:
+        fold_input: Fold input to process.
+        data_pipeline_config: Data pipeline config to use. If None, skip the data
+            pipeline.
+        model_runner: Model runner to use. If None, skip inference.
+        output_dir: Output directory to write to.
+        buckets: Bucket sizes to pad the data to, to avoid excessive re-compilation
+            of the model. If None, calculate the appropriate bucket size from the
+            number of tokens. If not None, must be a sequence of at least one integer,
+            in strictly increasing order. Will raise an error if the number of tokens
+            is more than the largest bucket size.
+        conformer_max_iterations: Optional override for maximum number of iterations
+            to run for RDKit conformer search.
+
+    Returns:
+        The processed fold input, or the inference results for each seed.
+
+    Raises:
+        ValueError: If the fold input has no chains.
+    """
     print(f'\nRunning fold job {fold_input.name}...')
-    
-    # 初始化特征缓存
-    feature_cache = FeatureCache(_FEATURE_CACHE_DIR.value)
-    
-    # 尝试从缓存加载特征
-    cached_features = feature_cache.get_cached_features(fold_input)
-    if cached_features is not None:
-        print('Using cached features')
-        featurised_examples = cached_features
-    else:
-        print(f'Featurising data with {len(fold_input.rng_seeds)} seed(s)...')
-        featurisation_start_time = time.time()
-        
-        # 获取CCD实例
-        ccd = chemical_components.cached_ccd(user_ccd=fold_input.user_ccd)
-        
-        # 并行特征化处理
-        featurised_examples = parallel_featurisation(
-            fold_input=fold_input,
-            buckets=buckets,
-            ccd=ccd,
-            num_workers=_NUM_FEATURE_WORKERS.value
+
+    if not fold_input.chains:
+        raise ValueError('Fold input has no chains.')
+
+    if os.path.exists(output_dir) and os.listdir(output_dir):
+        new_output_dir = (
+            f'{output_dir}_{datetime.datetime.now().strftime("%Y%m%d_%H%M%S")}'
         )
-        
         print(
-            f'Featurising data took {time.time() - featurisation_start_time:.2f}'
-            ' seconds.'
+            f'Output will be written in {new_output_dir} since {output_dir} is'
+            ' non-empty.'
         )
-        
-        # 缓存特征
-        feature_cache.cache_features(fold_input, featurised_examples)
+        output_dir = new_output_dir
+    else:
+        print(f'Output will be written in {output_dir}')
+
+    if data_pipeline_config is None:
+        print('Skipping data pipeline...')
+    else:
+        print('Running data pipeline...')
+        fold_input = pipeline.DataPipeline(data_pipeline_config).process(fold_input)
 
     write_fold_input_json(fold_input, output_dir)
     if model_runner is None:
@@ -649,378 +699,23 @@ def process_fold_input(
     return output
 
 
-def configure_jax_cache():
-    """配置JAX编译缓存"""
-    if _JAX_COMPILATION_CACHE_DIR.value is not None:
-        # 设置缓存目录
-        jax.config.update('jax_compilation_cache_dir', _JAX_COMPILATION_CACHE_DIR.value)
-        
-        # 设置缓存大小
-        jax.config.update('jax_compilation_cache_size_mb', _JAX_CACHE_SIZE.value)
-        
-        # 设置缓存淘汰策略
-        jax.config.update('jax_compilation_cache_eviction_policy', _JAX_CACHE_EVICTION.value)
-        
-        print(f'JAX compilation cache configured:')
-        print(f'- Cache directory: {_JAX_COMPILATION_CACHE_DIR.value}')
-        print(f'- Cache size: {_JAX_CACHE_SIZE.value}MB')
-        print(f'- Eviction policy: {_JAX_CACHE_EVICTION.value}')
-
-
-def optimize_bucket_sizes(fold_inputs: Sequence[folding_input.Input]) -> list[int]:
-    """根据输入序列长度分布优化bucket大小"""
-    # 收集所有序列长度
-    seq_lengths = []
-    for fold_input in fold_inputs:
-        for chain in fold_input.chains:
-            seq_lengths.append(len(chain.sequence))
-    
-    # 计算序列长度分布
-    seq_lengths = np.array(seq_lengths)
-    percentiles = np.percentile(seq_lengths, [25, 50, 75, 90, 95, 99])
-    
-    # 生成优化后的bucket大小
-    buckets = []
-    for p in percentiles:
-        # 向上取整到最近的64的倍数
-        bucket_size = int(np.ceil(p / 64) * 64)
-        if bucket_size not in buckets:
-            buckets.append(bucket_size)
-    
-    # 确保有足够大的bucket处理极端情况
-    max_length = max(seq_lengths)
-    if max_length > buckets[-1]:
-        buckets.append(int(np.ceil(max_length / 64) * 64))
-        
-    return sorted(buckets)
-
-def update_buckets(fold_inputs: Sequence[folding_input.Input]):
-    """更新bucket配置"""
-    if not _BUCKETS.value:  # 如果未指定bucket sizes
-        optimized_buckets = optimize_bucket_sizes(fold_inputs)
-        flags.FLAGS.buckets = [str(b) for b in optimized_buckets]
-        print(f'Optimized bucket sizes: {optimized_buckets}')
-
-
-def warmup_compilation(
-    model_runner: ModelRunner,
-    example_inputs: Sequence[features.BatchDict]
-) -> None:
-    """预热JAX编译缓存"""
-    print('Warming up JAX compilation cache...')
-    start_time = time.time()
-    
-    # 对每个bucket size进行预热
-    for bucket_size in map(int, _BUCKETS.value):
-        # 创建示例输入
-        dummy_input = create_dummy_batch(bucket_size)
-        # 运行一次前向传播进行预热
-        _ = model_runner.run_inference(
-            dummy_input,
-            jax.random.PRNGKey(0)
-        )
-        
-    print(f'Compilation warmup took {time.time() - start_time:.2f} seconds')
-
-def create_dummy_batch(size: int) -> features.BatchDict:
-    """创建指定大小的示例输入用于预热
-    
-    Args:
-        size: 序列长度
-        
-    Returns:
-        包含所有必要特征的dummy batch
-    """
-    num_templates = 1  # 至少需要一个模板
-    
-    # 创建基本特征
-    batch = {
-        'aatype': jnp.zeros((size,), dtype=jnp.int32),
-        'residue_index': jnp.arange(size),
-        'seq_length': jnp.array([size], dtype=jnp.int32),
-        'chain_index': jnp.zeros((size,), dtype=jnp.int32),
-        'residue_mask': jnp.ones((size,), dtype=jnp.float32),
-        
-        # MSA相关特征
-        'msa': jnp.zeros((1, size), dtype=jnp.int32),
-        'msa_mask': jnp.ones((1, size), dtype=jnp.float32),
-        'msa_row_mask': jnp.ones((1,), dtype=jnp.float32),
-        'msa_chain_index': jnp.zeros((1, size), dtype=jnp.int32),
-        'profile': jnp.zeros((size, 21), dtype=jnp.float32),
-        'profile_with_prior': jnp.zeros((size, 21), dtype=jnp.float32),
-        'profile_prob': jnp.ones((size,), dtype=jnp.float32),
-        
-        # 序列特征
-        'seq_mask': jnp.ones((size,), dtype=jnp.float32),
-        'entity_id': jnp.zeros((size,), dtype=jnp.int32),
-        
-        # 结构相关特征
-        'atom14_atom_exists': jnp.ones((size, 14), dtype=jnp.float32),
-        'atom37_atom_exists': jnp.ones((size, 37), dtype=jnp.float32),
-        'backbone_rigid_mask': jnp.ones((size,), dtype=jnp.float32),
-        'backbone_rigid_tensor': jnp.zeros((size, 4, 4), dtype=jnp.float32),
-        
-        # 模板相关特征
-        'template_aatype': jnp.zeros((num_templates, size), dtype=jnp.int32),
-        'template_all_atom_masks': jnp.zeros((num_templates, size, 37), dtype=jnp.float32),
-        'template_all_atom_positions': jnp.zeros((num_templates, size, 37, 3), dtype=jnp.float32),
-        'template_domain_names': jnp.zeros((num_templates,), dtype=jnp.int32),
-        'template_sequence': jnp.zeros((num_templates, size), dtype=jnp.int32),
-        'template_sum_probs': jnp.zeros((num_templates,), dtype=jnp.float32),
-        'template_mask': jnp.zeros((num_templates, size), dtype=jnp.float32),
-        'template_pseudo_beta': jnp.zeros((num_templates, size, 3), dtype=jnp.float32),
-        'template_pseudo_beta_mask': jnp.zeros((num_templates, size), dtype=jnp.float32),
-        'template_resolution': jnp.ones((num_templates,), dtype=jnp.float32),
-        'template_release_date': jnp.zeros((num_templates,), dtype=jnp.int32),
-        'template_atom_positions': jnp.zeros((num_templates, size, 37, 3), dtype=jnp.float32),
-        'template_atom_mask': jnp.zeros((num_templates, size, 37), dtype=jnp.float32),
-        'template_confidence_scores': jnp.zeros((num_templates, size), dtype=jnp.float32),
-        'template_enabled': jnp.ones((num_templates,), dtype=jnp.float32),
-        
-        # 其他必要特征
-        'resolution': jnp.array([1.0], dtype=jnp.float32),
-        'num_alignments': jnp.array([1], dtype=jnp.int32),
-        'cluster_bias_mask': jnp.ones((1, size), dtype=jnp.float32),
-        'deletion_matrix': jnp.zeros((1, size), dtype=jnp.float32),
-        'deletion_mean': jnp.zeros((size,), dtype=jnp.float32),
-        
-        # MSA统计特征
-        'extra_msa': jnp.zeros((1, size), dtype=jnp.int32),
-        'extra_msa_mask': jnp.ones((1, size), dtype=jnp.float32),
-        'extra_msa_row_mask': jnp.ones((1,), dtype=jnp.float32),
-        'extra_deletion_matrix': jnp.zeros((1, size), dtype=jnp.float32),
-        
-        # Token相关特征
-        'token_index': jnp.arange(size, dtype=jnp.int32),
-        'token_type': jnp.zeros((size,), dtype=jnp.int32),
-        'token_chain_index': jnp.zeros((size,), dtype=jnp.int32),
-        'token_mask': jnp.ones((size,), dtype=jnp.float32),
-        'token_residue_index': jnp.arange(size, dtype=jnp.int32),
-        'token_atom_pos': jnp.zeros((size, 37, 3), dtype=jnp.float32),
-        'token_atom_mask': jnp.ones((size, 37), dtype=jnp.float32),
-        'token_gt_positions': jnp.zeros((size, 37, 3), dtype=jnp.float32),
-        'token_gt_mask': jnp.ones((size, 37), dtype=jnp.float32),
-        'token_rigid_mask': jnp.ones((size,), dtype=jnp.float32),
-        'token_rigid_transform': jnp.zeros((size, 4, 4), dtype=jnp.float32),
-        
-        # 添加新的特征
-        'asym_id': jnp.zeros((size,), dtype=jnp.int32),
-        'sym_id': jnp.zeros((size,), dtype=jnp.int32),
-        'entity_id': jnp.zeros((size,), dtype=jnp.int32),
-        'num_sym': jnp.array([1], dtype=jnp.int32),
-        'assembly_num': jnp.array([1], dtype=jnp.int32),
-        'interface_exists': jnp.zeros((size,), dtype=jnp.bool_),
-        'interface_residue': jnp.zeros((size,), dtype=jnp.bool_),
-        'interface_chain_indices': jnp.zeros((size,), dtype=jnp.int32),
-        
-        # 结构组装相关特征
-        'assembly_features': {
-            'asym_id': jnp.zeros((1, size), dtype=jnp.int32),
-            'entity_id': jnp.zeros((1, size), dtype=jnp.int32),
-            'sym_id': jnp.zeros((1, size), dtype=jnp.int32),
-            'transform_pos': jnp.zeros((1, 3), dtype=jnp.float32),
-            'transform_rot': jnp.eye(3, dtype=jnp.float32)[None],
-        },
-        
-        # 分子类型相关特征
-        'is_protein': jnp.ones((size,), dtype=jnp.bool_),
-        'is_rna': jnp.zeros((size,), dtype=jnp.bool_),
-        'is_dna': jnp.zeros((size,), dtype=jnp.bool_),
-        'is_ligand': jnp.zeros((size,), dtype=jnp.bool_),
-        'is_water': jnp.zeros((size,), dtype=jnp.bool_),
-        'is_het': jnp.zeros((size,), dtype=jnp.bool_),
-        'molecule_type': jnp.zeros((size,), dtype=jnp.int32),
-        'molecule_name': jnp.zeros((size,), dtype=jnp.int32),
-        'residue_type': jnp.zeros((size,), dtype=jnp.int32),
-        
-        # 聚合物链相关特征
-        'is_nonstandard_polymer_chain': jnp.zeros((size,), dtype=jnp.bool_),
-        'is_modified_residue': jnp.zeros((size,), dtype=jnp.bool_),
-        'polymer_chain_type': jnp.zeros((size,), dtype=jnp.int32),
-        'polymer_chain_index': jnp.zeros((size,), dtype=jnp.int32),
-        'polymer_sequence_mask': jnp.ones((size,), dtype=jnp.float32),
-        'polymer_residue_position': jnp.arange(size, dtype=jnp.int32),
-        
-        # 参考结构相关特征
-        'ref_pos': jnp.zeros((size, 37, 3), dtype=jnp.float32),  # 参考原子位置
-        'ref_mask': jnp.zeros((size, 37), dtype=jnp.float32),  # 参考原子掩码
-        'ref_exists': jnp.zeros((size,), dtype=jnp.bool_),  # 参考结构存在标志
-        'ref_confidence': jnp.zeros((size,), dtype=jnp.float32),  # 参考结构置信度
-        'ref_resolution': jnp.array([3.0], dtype=jnp.float32),  # 参考结构分辨率
-        'ref_release_date': jnp.array([20240101], dtype=jnp.int32),  # 参考结构发布日期
-        'ref_chain_index': jnp.zeros((size,), dtype=jnp.int32),  # 参考链索引
-        'ref_aatype': jnp.zeros((size,), dtype=jnp.int32),  # 参考氨基酸类型
-        'ref_backbone_frame_tensor': jnp.zeros((size, 4, 4), dtype=jnp.float32),  # 参考骨架坐标系
-        'ref_backbone_frame_mask': jnp.zeros((size,), dtype=jnp.float32),  # 参考骨架掩码
-    }
-    
-    # 初始化参考骨架坐标系的对角线为1
-    batch['ref_backbone_frame_tensor'] = batch['ref_backbone_frame_tensor'].at[:, jnp.arange(4), jnp.arange(4)].set(1.0)
-    
-    # 初始化刚性变换矩阵的对角线为1
-    batch['token_rigid_transform'] = batch['token_rigid_transform'].at[:, jnp.arange(4), jnp.arange(4)].set(1.0)
-    
-    return batch
-
-def parallel_featurisation(
-    fold_input: folding_input.Input,
-    buckets: Sequence[int] | None,
-    ccd: dict,
-    num_workers: int | None = None
-) -> list[features.BatchDict]:
-    """并行处理特征化
-    
-    Args:
-        fold_input: 输入数据
-        buckets: bucket大小序列
-        ccd: 化学组分字典
-        num_workers: 并行worker数量,默认为min(seed数量, CPU核心数)
-    """
-    if num_workers is None:
-        num_workers = min(len(fold_input.rng_seeds), multiprocessing.cpu_count())
-    
-    print(f'Running parallel featurisation with {num_workers} workers')
-    
-    with multiprocessing.Pool(num_workers) as pool:
-        featurisation_args = [
-            (fold_input, seed, buckets, ccd)
-            for seed in fold_input.rng_seeds
-        ]
-        results = pool.starmap(
-            featurise_single_input,
-            featurisation_args
-        )
-    return results
-
-def featurise_single_input(
-    fold_input: folding_input.Input,
-    seed: int,
-    buckets: Sequence[int] | None,
-    ccd: dict,
-) -> features.BatchDict:
-    """处理单个输入的特征化
-    
-    Args:
-        fold_input: 输入数据
-        seed: 随机种子
-        buckets: bucket大小序列
-        ccd: 化学组分字典
-    """
-    single_seed_input = fold_input.with_single_seed(seed)
-    return featurisation.featurise_input(
-        fold_input=single_seed_input,
-        buckets=buckets,
-        ccd=ccd,
-        verbose=False
-    )
-
-class FeatureCache:
-    """特征缓存管理"""
-    def __init__(self, cache_dir: str | None = None):
-        self.cache_dir = cache_dir
-        if cache_dir:
-            os.makedirs(cache_dir, exist_ok=True)
-    
-    def get_cache_key(self, fold_input: folding_input.Input) -> str:
-        """生成缓存键"""
-        # 使用输入的关键信息生成唯一标识
-        key_components = [
-            fold_input.name,
-            *(chain.sequence for chain in fold_input.chains),
-            str(fold_input.rng_seeds)
-        ]
-        return hashlib.md5('_'.join(key_components).encode()).hexdigest()
-    
-    def get_cached_features(
-        self, 
-        fold_input: folding_input.Input
-    ) -> list[features.BatchDict] | None:
-        """获取缓存的特征"""
-        if not self.cache_dir:
-            return None
-            
-        cache_key = self.get_cache_key(fold_input)
-        cache_path = os.path.join(self.cache_dir, f'{cache_key}.npz')
-        
-        if os.path.exists(cache_path):
-            try:
-                with np.load(cache_path, allow_pickle=True) as data:
-                    return data['features']
-            except Exception as e:
-                print(f'Failed to load cache: {e}')
-                return None
-        return None
-    
-    def cache_features(
-        self,
-        fold_input: folding_input.Input,
-        features_list: list[features.BatchDict]
-    ) -> None:
-        """缓存特征"""
-        if not self.cache_dir:
-            return
-            
-        cache_key = self.get_cache_key(fold_input)
-        cache_path = os.path.join(self.cache_dir, f'{cache_key}.npz')
-        
-        try:
-            np.savez_compressed(
-                cache_path,
-                features=features_list
-            )
-        except Exception as e:
-            print(f'Failed to save cache: {e}')
-
-def optimize_feature_preprocessing(
-    fold_input: folding_input.Input,
-    buckets: Sequence[int] | None,
-    ccd: dict,
-) -> features.BatchDict:
-    """优化特征预处理
-    
-    Args:
-        fold_input: 输入数据
-        buckets: bucket大小序列
-        ccd: 化学组分字典
-    """
-    # 1. 提前分配内存
-    max_length = max(len(chain.sequence) for chain in fold_input.chains)
-    if buckets:
-        max_length = min(max(buckets), max_length)
-    
-    # 2. 预分配特征数组
-    prealloc_features = {
-        'aatype': np.zeros((max_length,), dtype=np.int32),
-        'residue_index': np.arange(max_length),
-        'seq_length': np.array([max_length], dtype=np.int32),
-        'chain_index': np.zeros((max_length,), dtype=np.int32),
-        'residue_mask': np.zeros((max_length,), dtype=np.float32),
-    }
-    
-    # 3. 使用向量化操作
-    current_idx = 0
-    for chain_idx, chain in enumerate(fold_input.chains):
-        seq_length = len(chain.sequence)
-        # 转换氨基酸序列到索引
-        aa_indices = np.array([
-            chemical_components.get_residue_index(aa, ccd)
-            for aa in chain.sequence
-        ])
-        
-        # 批量更新特征
-        prealloc_features['aatype'][current_idx:current_idx + seq_length] = aa_indices
-        prealloc_features['chain_index'][current_idx:current_idx + seq_length] = chain_idx
-        prealloc_features['residue_mask'][current_idx:current_idx + seq_length] = 1.0
-        
-        current_idx += seq_length
-    
-    return prealloc_features
-
 def main(_):
-    # 配置JAX缓存
-    configure_jax_cache()
-    
-    # 加载输入数据
+    if _JAX_COMPILATION_CACHE_DIR.value is not None:
+        jax.config.update(
+            'jax_compilation_cache_dir', _JAX_COMPILATION_CACHE_DIR.value
+        )
+
+    if _JSON_PATH.value is None == _INPUT_DIR.value is None:
+        raise ValueError(
+            'Exactly one of --json_path or --input_dir must be specified.'
+        )
+
+    if not _RUN_INFERENCE.value and not _RUN_DATA_PIPELINE.value:
+        raise ValueError(
+            'At least one of --run_inference or --run_data_pipeline must be'
+            ' set to true.'
+        )
+
     if _INPUT_DIR.value is not None:
         fold_inputs = folding_input.load_fold_inputs_from_dir(
             pathlib.Path(_INPUT_DIR.value)
@@ -1029,33 +724,58 @@ def main(_):
         fold_inputs = folding_input.load_fold_inputs_from_path(
             pathlib.Path(_JSON_PATH.value)
         )
-    
-    # 优化bucket sizes
-    update_buckets(fold_inputs)
-    
-    if _RUN_INFERENCE.value:
-        # 初始化模型
-        model_runner = ModelRunner(
-            config=make_model_config(
-                flash_attention_implementation=typing.cast(
-                    attention.Implementation, _FLASH_ATTENTION_IMPLEMENTATION.value
-                ),
-                num_diffusion_samples=_NUM_DIFFUSION_SAMPLES.value,
-                num_recycles=_NUM_RECYCLES.value,
-                return_embeddings=_SAVE_EMBEDDINGS.value,
-            ),
-            device=jax.local_devices(backend='gpu')[_GPU_DEVICE.value],
-            model_dir=pathlib.Path(MODEL_DIR.value),
+    else:
+        raise AssertionError(
+            'Exactly one of --json_path or --input_dir must be specified.'
         )
-        
-        # 创建示例输入进行编译预热
-        example_inputs = [
-            create_dummy_batch(int(bucket))
-            for bucket in _BUCKETS.value[:3]  # 只预热前几个常用size
-        ]
-        warmup_compilation(model_runner, example_inputs)
-        
-        # 继续处理实际输入...
+
+    # Make sure we can create the output directory before running anything.
+    try:
+        os.makedirs(_OUTPUT_DIR.value, exist_ok=True)
+    except OSError as e:
+        print(f'Failed to create output directory {_OUTPUT_DIR.value}: {e}')
+        raise
+
+    if _RUN_INFERENCE.value:
+        # Fail early on incompatible devices, but only if we're running inference.
+        gpu_devices = jax.local_devices(backend='gpu')
+        if gpu_devices:
+            compute_capability = float(
+                gpu_devices[_GPU_DEVICE.value].compute_capability
+            )
+            if compute_capability < 6.0:
+                raise ValueError(
+                    'AlphaFold 3 requires at least GPU compute capability 6.0 (see'
+                    ' https://developer.nvidia.com/cuda-gpus).'
+                )
+            elif 7.0 <= compute_capability < 8.0:
+                xla_flags = os.environ.get('XLA_FLAGS')
+                required_flag = '--xla_disable_hlo_passes=custom-kernel-fusion-rewriter'
+                if not xla_flags or required_flag not in xla_flags:
+                    raise ValueError(
+                        'For devices with GPU compute capability 7.x (see'
+                        ' https://developer.nvidia.com/cuda-gpus) the ENV XLA_FLAGS must'
+                        f' include "{required_flag}".'
+                    )
+                if _FLASH_ATTENTION_IMPLEMENTATION.value != 'xla':
+                    raise ValueError(
+                        'For devices with GPU compute capability 7.x (see'
+                        ' https://developer.nvidia.com/cuda-gpus) the'
+                        ' --flash_attention_implementation must be set to "xla".'
+                    )
+
+    notice = textwrap.wrap(
+        'Running AlphaFold 3. Please note that standard AlphaFold 3 model'
+        ' parameters are only available under terms of use provided at'
+        ' https://github.com/google-deepmind/alphafold3/blob/main/WEIGHTS_TERMS_OF_USE.md.'
+        ' If you do not agree to these terms and are using AlphaFold 3 derived'
+        ' model parameters, cancel execution of AlphaFold 3 inference with'
+        ' CTRL-C, and do not use the model parameters.',
+        break_long_words=False,
+        break_on_hyphens=False,
+        width=80,
+    )
+    print('\n' + '\n'.join(notice) + '\n')
 
     if _RUN_DATA_PIPELINE.value:
         expand_path = lambda x: replace_db_dir(x, DB_DIR.value)
@@ -1129,5 +849,5 @@ def main(_):
 
 
 if __name__ == '__main__':
-  flags.mark_flags_as_required(['output_dir'])
-  app.run(main)
+    flags.mark_flags_as_required(['output_dir'])
+    app.run(main)
