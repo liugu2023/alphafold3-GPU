@@ -281,8 +281,6 @@ _start_time = time.time()
 def clear_gpu_memory():
     """清理GPU内存的通用函数"""
     try:
-        import gc
-        import torch
         gc.collect()
         torch.cuda.empty_cache()
         jax.clear_caches()
