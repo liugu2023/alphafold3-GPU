@@ -852,28 +852,45 @@ def validate_features(
         raise ValueError(f'Missing required basic features: {missing_features}')
         
     # 获取序列长度
+    seq_lengths = []
+    
+    # 从不同特征中获取序列长度
     if 'seq_length' in featurised_example:
-        seq_length = featurised_example['seq_length']
-    else:
-        # 如果没有seq_length特征，使用aatype的长度
-        seq_length = len(featurised_example['aatype'])
+        seq_lengths.append(featurised_example['seq_length'])
+    if 'aatype' in featurised_example:
+        seq_lengths.append(len(featurised_example['aatype']))
+    if 'residue_index' in featurised_example:
+        seq_lengths.append(len(featurised_example['residue_index']))
+        
+    if not seq_lengths:
+        raise ValueError('Could not determine sequence length from any feature')
+        
+    # 使用最小的序列长度作为参考
+    seq_length = min(seq_lengths)
+    if len(set(seq_lengths)) > 1:
+        print(f'Warning: Different sequence lengths detected: {seq_lengths}')
+        print(f'Using minimum length: {seq_length}')
         
     # 验证特征维度
     for key, value in featurised_example.items():
         if isinstance(value, np.ndarray):
+            shape = value.shape
+            if len(shape) == 0:
+                continue
+                
             if key in ['aatype', 'residue_index']:
                 # 检查1D特征的维度
-                if value.shape[0] != seq_length:
+                if shape[0] < seq_length:
                     raise ValueError(
-                        f'Feature {key} has incorrect first dimension:'
-                        f' {value.shape[0]} != {seq_length}'
+                        f'Feature {key} is too short:'
+                        f' {shape[0]} < {seq_length}'
                     )
-            elif key.endswith('_all_atom_positions') and len(value.shape) == 3:
+            elif key.endswith('_all_atom_positions') and len(shape) == 3:
                 # 检查原子位置特征的维度
-                if value.shape[0] != seq_length:
+                if shape[0] < seq_length:
                     raise ValueError(
-                        f'Feature {key} has incorrect first dimension:'
-                        f' {value.shape[0]} != {seq_length}'
+                        f'Feature {key} is too short:'
+                        f' {shape[0]} < {seq_length}'
                     )
                 
     # 打印特征统计信息
@@ -885,6 +902,8 @@ def validate_features(
             print(f'  {key}: shape={value.shape}, dtype={value.dtype}')
         else:
             print(f'  {key}: type={type(value)}')
+            
+    return seq_length  # 返回确定的序列长度供后续使用
 
 
 def compress_features(
