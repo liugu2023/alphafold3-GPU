@@ -33,6 +33,7 @@ import textwrap
 import time
 import typing
 from typing import overload, Optional
+import tempfile
 
 from absl import app
 from absl import flags
@@ -315,7 +316,19 @@ class ModelRunner:
             
         # 启用编译进度监控
         if config.global_config.enable_jax_profiler:
-            jax.profiler.start_trace()
+            # 创建临时目录存储profiler日志
+            self._profiler_dir = tempfile.mkdtemp(prefix='jax_profile_')
+            print(f'JAX profiler logs will be written to {self._profiler_dir}')
+            jax.profiler.start_trace(self._profiler_dir)
+
+    def __del__(self):
+        """清理profiler资源."""
+        if hasattr(self, '_profiler_dir'):
+            try:
+                jax.profiler.stop_trace()
+                print(f'JAX profiler logs saved to {self._profiler_dir}')
+            except:
+                pass
 
     def _get_optimal_bucket_size(self, num_tokens: int) -> int:
         """根据输入token数选择最优bucket size."""
@@ -348,7 +361,7 @@ class ModelRunner:
         )
 
     def run_inference(
-        self, 
+        self,
         featurised_example: features.BatchDict,
         rng_key: jnp.ndarray
     ) -> model.ModelResult:
@@ -357,34 +370,41 @@ class ModelRunner:
         num_tokens = len(featurised_example['token_chain_ids'])
         bucket_size = self._get_optimal_bucket_size(num_tokens)
         
+        print(f'Using bucket size {bucket_size} for {num_tokens} tokens')
+        
         # 根据bucket size填充输入
         if bucket_size > num_tokens:
+            print(f'Padding input from {num_tokens} to {bucket_size} tokens')
             featurised_example = self._pad_to_bucket_size(
                 featurised_example, 
                 bucket_size
             )
             
         # 转移数据到设备
-        featurised_example = jax.device_put(
-            jax.tree_util.tree_map(
-                jnp.asarray,
-                utils.remove_invalidly_typed_feats(featurised_example)
-            ),
-            self._device,
-        )
+        with jax.profiler.TraceContext("device_transfer"):
+            featurised_example = jax.device_put(
+                jax.tree_util.tree_map(
+                    jnp.asarray,
+                    utils.remove_invalidly_typed_feats(featurised_example)
+                ),
+                self._device,
+            )
 
         # 执行推理
-        result = self._model(rng_key, featurised_example)
+        with jax.profiler.TraceContext("model_inference"):
+            result = self._model(rng_key, featurised_example)
         
         # 移除padding并转换结果
         if bucket_size > num_tokens:
+            print(f'Removing padding from results')
             result = self._remove_padding(result, num_tokens)
             
-        result = jax.tree.map(np.asarray, result)
-        result = jax.tree.map(
-            lambda x: x.astype(jnp.float32) if x.dtype == jnp.bfloat16 else x,
-            result,
-        )
+        with jax.profiler.TraceContext("post_processing"):
+            result = jax.tree.map(np.asarray, result)
+            result = jax.tree.map(
+                lambda x: x.astype(jnp.float32) if x.dtype == jnp.bfloat16 else x,
+                result,
+            )
         
         # 添加模型标识
         result = dict(result)
@@ -399,8 +419,28 @@ class ModelRunner:
         bucket_size: int
     ) -> features.BatchDict:
         """将输入填充到bucket size."""
-        # 实现填充逻辑
-        return example  # TODO: 实现实际的填充逻辑
+        padded = dict(example)
+        
+        # 填充token相关特征
+        for key in ['token_chain_ids', 'token_residue_ids', 'token_atom_ids']:
+            if key in padded:
+                orig_data = padded[key]
+                pad_size = bucket_size - len(orig_data)
+                padded[key] = np.pad(orig_data, (0, pad_size), mode='constant')
+                
+        # 填充2D特征
+        for key in padded:
+            if isinstance(padded[key], np.ndarray):
+                shape = padded[key].shape
+                if len(shape) == 2 and shape[0] == shape[1]:
+                    pad_size = bucket_size - shape[0]
+                    padded[key] = np.pad(
+                        padded[key],
+                        ((0, pad_size), (0, pad_size)),
+                        mode='constant'
+                    )
+                    
+        return padded
 
     def _remove_padding(
         self,
@@ -408,8 +448,18 @@ class ModelRunner:
         original_size: int
     ) -> model.ModelResult:
         """移除结果中的padding."""
-        # 实现padding移除逻辑  
-        return result  # TODO: 实现实际的padding移除逻辑
+        unpadded = dict(result)
+        
+        # 移除1D结果中的padding
+        for key in unpadded:
+            if isinstance(unpadded[key], np.ndarray):
+                shape = unpadded[key].shape
+                if len(shape) == 1:
+                    unpadded[key] = unpadded[key][:original_size]
+                elif len(shape) == 2 and shape[0] == shape[1]:
+                    unpadded[key] = unpadded[key][:original_size, :original_size]
+                    
+        return unpadded
 
     def extract_inference_results_and_maybe_embeddings(
         self,
