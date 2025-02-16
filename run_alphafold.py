@@ -772,6 +772,10 @@ def create_dummy_batch(size: int) -> features.BatchDict:
         'template_pseudo_beta_mask': jnp.zeros((num_templates, size), dtype=jnp.float32),
         'template_resolution': jnp.ones((num_templates,), dtype=jnp.float32),
         'template_release_date': jnp.zeros((num_templates,), dtype=jnp.int32),
+        'template_atom_positions': jnp.zeros((num_templates, size, 37, 3), dtype=jnp.float32),
+        'template_atom_mask': jnp.zeros((num_templates, size, 37), dtype=jnp.float32),
+        'template_confidence_scores': jnp.zeros((num_templates, size), dtype=jnp.float32),
+        'template_enabled': jnp.ones((num_templates,), dtype=jnp.float32),
         
         # 其他必要特征
         'resolution': jnp.array([1.0], dtype=jnp.float32),
