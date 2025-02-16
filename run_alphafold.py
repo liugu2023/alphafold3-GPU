@@ -323,21 +323,19 @@ class ModelRunner:
             os.makedirs(_JAX_COMPILATION_CACHE_DIR.value, exist_ok=True)
             jax.config.update('jax_compilation_cache_dir', _JAX_COMPILATION_CACHE_DIR.value)
             
-        # 启用编译进度监控
-        if config.global_config.enable_jax_profiler:
-            # 创建临时目录存储profiler日志
-            self._profiler_dir = tempfile.mkdtemp(prefix='jax_profile_')
-            print(f'JAX profiler logs will be written to {self._profiler_dir}')
-            jax.profiler.start_trace(self._profiler_dir)
+        # 使用简单的性能统计替代JAX profiler
+        self._perf_stats = {
+            'compile_time': 0.0,
+            'inference_time': 0.0,
+            'data_transfer_time': 0.0
+        }
 
     def __del__(self):
-        """清理profiler资源."""
-        if hasattr(self, '_profiler_dir'):
-            try:
-                jax.profiler.stop_trace()
-                print(f'JAX profiler logs saved to {self._profiler_dir}')
-            except:
-                pass
+        """输出性能统计信息."""
+        if hasattr(self, '_perf_stats'):
+            print('\nPerformance Statistics:')
+            for key, value in self._perf_stats.items():
+                print(f'  {key}: {value:.2f} seconds')
 
     def _get_optimal_bucket_size(self, num_tokens: int) -> int:
         """根据输入token数选择最优bucket size."""
@@ -376,7 +374,6 @@ class ModelRunner:
     ) -> model.ModelResult:
         """优化后的模型推理."""
         # 获取token数并选择bucket
-        # 修改: 使用更可靠的方式获取序列长度
         num_tokens = 0
         for key in ['token_chain_ids', 'aatype', 'residue_index']:
             if key in featurised_example:
@@ -403,6 +400,7 @@ class ModelRunner:
             
         # 转移数据到设备
         print('Transferring data to device...')
+        transfer_start = time.time()
         featurised_example = jax.device_put(
             jax.tree_util.tree_map(
                 jnp.asarray,
@@ -410,10 +408,15 @@ class ModelRunner:
             ),
             self._device,
         )
+        self._perf_stats['data_transfer_time'] += time.time() - transfer_start
 
         # 执行推理
         print('Running model inference...')
+        inference_start = time.time()
         result = self._model(rng_key, featurised_example)
+        inference_time = time.time() - inference_start
+        self._perf_stats['inference_time'] += inference_time
+        print(f'Inference took {inference_time:.2f} seconds')
         
         # 移除padding并转换结果
         if bucket_size > num_tokens:
@@ -421,6 +424,7 @@ class ModelRunner:
             result = self._remove_padding(result, num_tokens)
         
         print('Post-processing results...')
+        post_start = time.time()
         result = jax.tree.map(np.asarray, result)
         result = jax.tree.map(
             lambda x: x.astype(jnp.float32) if x.dtype == jnp.bfloat16 else x,
@@ -431,6 +435,8 @@ class ModelRunner:
         result = dict(result)
         identifier = self.model_params['__meta__']['__identifier__'].tobytes()
         result['__identifier__'] = identifier
+        
+        self._perf_stats['compile_time'] += time.time() - post_start
         
         return result
 
