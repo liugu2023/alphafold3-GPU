@@ -367,9 +367,21 @@ class ModelRunner:
     ) -> model.ModelResult:
         """优化后的模型推理."""
         # 获取token数并选择bucket
-        num_tokens = len(featurised_example['token_chain_ids'])
-        bucket_size = self._get_optimal_bucket_size(num_tokens)
+        # 修改: 使用更可靠的方式获取序列长度
+        num_tokens = 0
+        for key in ['token_chain_ids', 'aatype', 'residue_index']:
+            if key in featurised_example:
+                num_tokens = len(featurised_example[key])
+                break
+            
+        if num_tokens == 0:
+            raise ValueError(
+                'Could not determine sequence length from featurised example. '
+                'Expected at least one of: token_chain_ids, aatype, residue_index'
+            )
         
+        print(f'Detected sequence length: {num_tokens}')
+        bucket_size = self._get_optimal_bucket_size(num_tokens)
         print(f'Using bucket size {bucket_size} for {num_tokens} tokens')
         
         # 根据bucket size填充输入
@@ -398,7 +410,7 @@ class ModelRunner:
         if bucket_size > num_tokens:
             print(f'Removing padding from results')
             result = self._remove_padding(result, num_tokens)
-            
+        
         with jax.profiler.TraceContext("post_processing"):
             result = jax.tree.map(np.asarray, result)
             result = jax.tree.map(
@@ -421,24 +433,43 @@ class ModelRunner:
         """将输入填充到bucket size."""
         padded = dict(example)
         
-        # 填充token相关特征
-        for key in ['token_chain_ids', 'token_residue_ids', 'token_atom_ids']:
-            if key in padded:
-                orig_data = padded[key]
-                pad_size = bucket_size - len(orig_data)
-                padded[key] = np.pad(orig_data, (0, pad_size), mode='constant')
-                
-        # 填充2D特征
-        for key in padded:
-            if isinstance(padded[key], np.ndarray):
-                shape = padded[key].shape
-                if len(shape) == 2 and shape[0] == shape[1]:
-                    pad_size = bucket_size - shape[0]
+        # 填充1D特征
+        for key, value in padded.items():
+            if not isinstance(value, (np.ndarray, jnp.ndarray)):
+                continue
+            
+            shape = value.shape
+            if len(shape) == 1:
+                # 1D特征需要填充到bucket_size
+                pad_size = bucket_size - shape[0]
+                if pad_size > 0:
                     padded[key] = np.pad(
-                        padded[key],
-                        ((0, pad_size), (0, pad_size)),
-                        mode='constant'
+                        value,
+                        (0, pad_size),
+                        mode='constant',
+                        constant_values=0
                     )
+            elif len(shape) == 2:
+                if shape[0] == shape[1]:
+                    # 方形2D特征需要在两个维度上填充
+                    pad_size = bucket_size - shape[0]
+                    if pad_size > 0:
+                        padded[key] = np.pad(
+                            value,
+                            ((0, pad_size), (0, pad_size)),
+                            mode='constant',
+                            constant_values=0
+                        )
+                elif shape[0] == example['aatype'].shape[0]:
+                    # 非方形2D特征,只在第一个维度填充
+                    pad_size = bucket_size - shape[0]
+                    if pad_size > 0:
+                        padded[key] = np.pad(
+                            value,
+                            ((0, pad_size), (0, 0)),
+                            mode='constant',
+                            constant_values=0
+                        )
                     
         return padded
 
@@ -450,15 +481,23 @@ class ModelRunner:
         """移除结果中的padding."""
         unpadded = dict(result)
         
-        # 移除1D结果中的padding
-        for key in unpadded:
-            if isinstance(unpadded[key], np.ndarray):
-                shape = unpadded[key].shape
-                if len(shape) == 1:
-                    unpadded[key] = unpadded[key][:original_size]
-                elif len(shape) == 2 and shape[0] == shape[1]:
-                    unpadded[key] = unpadded[key][:original_size, :original_size]
-                    
+        # 移除padding
+        for key, value in unpadded.items():
+            if not isinstance(value, (np.ndarray, jnp.ndarray)):
+                continue
+            
+            shape = value.shape
+            if len(shape) == 1:
+                # 移除1D特征的padding
+                unpadded[key] = value[:original_size]
+            elif len(shape) == 2:
+                if shape[0] == shape[1]:
+                    # 移除方形2D特征的padding
+                    unpadded[key] = value[:original_size, :original_size]
+                elif shape[0] > original_size:
+                    # 移除非方形2D特征的padding
+                    unpadded[key] = value[:original_size]
+                
         return unpadded
 
     def extract_inference_results_and_maybe_embeddings(
