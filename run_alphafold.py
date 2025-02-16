@@ -791,17 +791,36 @@ def create_dummy_batch(size: int) -> features.BatchDict:
         'extra_deletion_matrix': jnp.zeros((1, size), dtype=jnp.float32),
         
         # Token相关特征
-        'token_index': jnp.arange(size, dtype=jnp.int32),  # 添加token索引
-        'token_type': jnp.zeros((size,), dtype=jnp.int32),  # token类型
-        'token_chain_index': jnp.zeros((size,), dtype=jnp.int32),  # token所属链的索引
-        'token_mask': jnp.ones((size,), dtype=jnp.float32),  # token掩码
-        'token_residue_index': jnp.arange(size, dtype=jnp.int32),  # token残基索引
-        'token_atom_pos': jnp.zeros((size, 37, 3), dtype=jnp.float32),  # token原子位置
-        'token_atom_mask': jnp.ones((size, 37), dtype=jnp.float32),  # token原子掩码
-        'token_gt_positions': jnp.zeros((size, 37, 3), dtype=jnp.float32),  # ground truth位置
-        'token_gt_mask': jnp.ones((size, 37), dtype=jnp.float32),  # ground truth掩码
-        'token_rigid_mask': jnp.ones((size,), dtype=jnp.float32),  # token刚性掩码
-        'token_rigid_transform': jnp.zeros((size, 4, 4), dtype=jnp.float32),  # token刚性变换
+        'token_index': jnp.arange(size, dtype=jnp.int32),
+        'token_type': jnp.zeros((size,), dtype=jnp.int32),
+        'token_chain_index': jnp.zeros((size,), dtype=jnp.int32),
+        'token_mask': jnp.ones((size,), dtype=jnp.float32),
+        'token_residue_index': jnp.arange(size, dtype=jnp.int32),
+        'token_atom_pos': jnp.zeros((size, 37, 3), dtype=jnp.float32),
+        'token_atom_mask': jnp.ones((size, 37), dtype=jnp.float32),
+        'token_gt_positions': jnp.zeros((size, 37, 3), dtype=jnp.float32),
+        'token_gt_mask': jnp.ones((size, 37), dtype=jnp.float32),
+        'token_rigid_mask': jnp.ones((size,), dtype=jnp.float32),
+        'token_rigid_transform': jnp.zeros((size, 4, 4), dtype=jnp.float32),
+        
+        # 添加新的特征
+        'asym_id': jnp.zeros((size,), dtype=jnp.int32),
+        'sym_id': jnp.zeros((size,), dtype=jnp.int32),
+        'entity_id': jnp.zeros((size,), dtype=jnp.int32),
+        'num_sym': jnp.array([1], dtype=jnp.int32),
+        'assembly_num': jnp.array([1], dtype=jnp.int32),
+        'interface_exists': jnp.zeros((size,), dtype=jnp.bool_),
+        'interface_residue': jnp.zeros((size,), dtype=jnp.bool_),
+        'interface_chain_indices': jnp.zeros((size,), dtype=jnp.int32),
+        
+        # 结构组装相关特征
+        'assembly_features': {
+            'asym_id': jnp.zeros((1, size), dtype=jnp.int32),
+            'entity_id': jnp.zeros((1, size), dtype=jnp.int32),
+            'sym_id': jnp.zeros((1, size), dtype=jnp.int32),
+            'transform_pos': jnp.zeros((1, 3), dtype=jnp.float32),
+            'transform_rot': jnp.eye(3, dtype=jnp.float32)[None],
+        },
     }
     
     # 初始化刚性变换矩阵的对角线为1
