@@ -20,10 +20,12 @@ https://github.com/google-deepmind/alphafold3/blob/main/WEIGHTS_TERMS_OF_USE.md
 """
 
 import os
-# 在导入jax之前设置环境变量
+# GPU优化相关环境变量
 os.environ['JAX_PLATFORMS'] = 'cuda'  # 只使用CUDA
 os.environ['JAX_DISABLE_MOST_OPTIMIZATIONS'] = '0'  # 启用优化
 os.environ['XLA_PYTHON_CLIENT_ALLOCATOR'] = 'platform'  # 使用平台默认内存分配器
+os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '0.95'  # 允许使用95%的GPU内存
+os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'  # 允许GPU内存动态增长
 
 from collections.abc import Callable, Sequence
 import csv
@@ -318,11 +320,11 @@ def get_gpu_memory():
             'free': 16*1024
         }
 
-def check_gpu_memory(threshold_mb=1000):
+def check_gpu_memory(threshold_mb=2000):  # 提高阈值到2GB
     """检查是否有足够的GPU内存
     
     Args:
-        threshold_mb: 最小所需的可用内存(MB)
+        threshold_mb: 最小所需的可用内存(MB)，默认2GB
         
     Returns:
         bool: 是否有足够的可用内存
@@ -659,26 +661,28 @@ def find_optimal_batch_size(
 ) -> int:
     """找到最优的批处理大小
     
-    Args:
-        examples: 要处理的样本列表
-        model_runner: 模型运行器
-        fold_input: 输入数据
-        max_batch_size: 最大允许的批大小
-        min_batch_size: 最小允许的批大小
-        
-    Returns:
-        int: 最优的批处理大小
+    为3090 24GB显卡优化的版本
     """
     print("Finding optimal batch size...")
     
     # 获取序列长度
     seq_length = len(fold_input.chains[0].sequence)
     
-    # 根据序列长度设置初始最大批大小
+    # 根据序列长度和显存大小调整最大批大小
     if seq_length > 1000:
-        max_batch_size = min(2, max_batch_size)
+        max_batch_size = min(3, max_batch_size)  # 长序列最多3个批次
     elif seq_length > 500:
-        max_batch_size = min(4, max_batch_size)
+        max_batch_size = min(5, max_batch_size)  # 中等序列最多5个批次
+    else:
+        max_batch_size = min(8, max_batch_size)  # 短序列最多8个批次
+        
+    # 获取可用显存
+    mem_info = get_gpu_memory()
+    total_mem_gb = mem_info['total'] / 1024  # 转换为GB
+    
+    # 根据总显存调整最大批大小
+    if total_mem_gb >= 20:  # 24GB显卡
+        max_batch_size = min(max_batch_size, int(total_mem_gb / 3))  # 每个样本预估使用3GB显存
     
     best_batch_size = min_batch_size
     best_time_per_sample = float('inf')
@@ -692,6 +696,7 @@ def find_optimal_batch_size(
             model_runner=model_runner,
             batch_size=batch_size,
             fold_input=fold_input,
+            max_memory_usage_percent=90.0,  # 允许使用更多显存
         )
         
         if not success:
