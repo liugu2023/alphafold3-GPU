@@ -731,6 +731,8 @@ def create_dummy_batch(size: int) -> features.BatchDict:
     Returns:
         包含所有必要特征的dummy batch
     """
+    num_templates = 1  # 至少需要一个模板
+    
     # 创建基本特征
     batch = {
         'aatype': jnp.zeros((size,), dtype=jnp.int32),
@@ -740,11 +742,11 @@ def create_dummy_batch(size: int) -> features.BatchDict:
         'residue_mask': jnp.ones((size,), dtype=jnp.float32),
         
         # MSA相关特征
-        'msa': jnp.zeros((1, size), dtype=jnp.int32),  # 至少需要1个MSA序列
+        'msa': jnp.zeros((1, size), dtype=jnp.int32),
         'msa_mask': jnp.ones((1, size), dtype=jnp.float32),
         'msa_row_mask': jnp.ones((1,), dtype=jnp.float32),
         'msa_chain_index': jnp.zeros((1, size), dtype=jnp.int32),
-        'profile': jnp.zeros((size, 21), dtype=jnp.float32),  # 添加profile特征
+        'profile': jnp.zeros((size, 21), dtype=jnp.float32),
         'profile_with_prior': jnp.zeros((size, 21), dtype=jnp.float32),
         'profile_prob': jnp.ones((size,), dtype=jnp.float32),
         
@@ -757,6 +759,19 @@ def create_dummy_batch(size: int) -> features.BatchDict:
         'atom37_atom_exists': jnp.ones((size, 37), dtype=jnp.float32),
         'backbone_rigid_mask': jnp.ones((size,), dtype=jnp.float32),
         'backbone_rigid_tensor': jnp.zeros((size, 4, 4), dtype=jnp.float32),
+        
+        # 模板相关特征
+        'template_aatype': jnp.zeros((num_templates, size), dtype=jnp.int32),
+        'template_all_atom_masks': jnp.zeros((num_templates, size, 37), dtype=jnp.float32),
+        'template_all_atom_positions': jnp.zeros((num_templates, size, 37, 3), dtype=jnp.float32),
+        'template_domain_names': jnp.zeros((num_templates,), dtype=jnp.int32),
+        'template_sequence': jnp.zeros((num_templates, size), dtype=jnp.int32),
+        'template_sum_probs': jnp.zeros((num_templates,), dtype=jnp.float32),
+        'template_mask': jnp.zeros((num_templates, size), dtype=jnp.float32),
+        'template_pseudo_beta': jnp.zeros((num_templates, size, 3), dtype=jnp.float32),
+        'template_pseudo_beta_mask': jnp.zeros((num_templates, size), dtype=jnp.float32),
+        'template_resolution': jnp.ones((num_templates,), dtype=jnp.float32),
+        'template_release_date': jnp.zeros((num_templates,), dtype=jnp.int32),
         
         # 其他必要特征
         'resolution': jnp.array([1.0], dtype=jnp.float32),
