@@ -834,25 +834,51 @@ def validate_features(
     if isinstance(featurised_example, list):
         featurised_example = featurised_example[0]
         
+    # 基本必需特征
     required_features = {
-        'aatype', 'residue_index', 'seq_length',
-        'template_aatype', 'template_all_atom_positions'
+        'aatype', 
+        'residue_index'
     }
     
-    # 检查必需特征
+    # 检查基本必需特征
     missing_features = required_features - set(featurised_example.keys())
     if missing_features:
-        raise ValueError(f'Missing required features: {missing_features}')
+        raise ValueError(f'Missing required basic features: {missing_features}')
+        
+    # 获取序列长度
+    if 'seq_length' in featurised_example:
+        seq_length = featurised_example['seq_length']
+    else:
+        # 如果没有seq_length特征，使用aatype的长度
+        seq_length = len(featurised_example['aatype'])
         
     # 验证特征维度
-    seq_length = featurised_example['seq_length']
     for key, value in featurised_example.items():
         if isinstance(value, np.ndarray):
-            if value.shape[0] != seq_length:
-                raise ValueError(
-                    f'Feature {key} has incorrect first dimension:'
-                    f' {value.shape[0]} != {seq_length}'
-                )
+            if key in ['aatype', 'residue_index']:
+                # 检查1D特征的维度
+                if value.shape[0] != seq_length:
+                    raise ValueError(
+                        f'Feature {key} has incorrect first dimension:'
+                        f' {value.shape[0]} != {seq_length}'
+                    )
+            elif key.endswith('_all_atom_positions') and len(value.shape) == 3:
+                # 检查原子位置特征的维度
+                if value.shape[0] != seq_length:
+                    raise ValueError(
+                        f'Feature {key} has incorrect first dimension:'
+                        f' {value.shape[0]} != {seq_length}'
+                    )
+                
+    # 打印特征统计信息
+    print('\nFeature validation summary:')
+    print(f'Sequence length: {seq_length}')
+    print('Available features:')
+    for key, value in featurised_example.items():
+        if isinstance(value, np.ndarray):
+            print(f'  {key}: shape={value.shape}, dtype={value.dtype}')
+        else:
+            print(f'  {key}: type={type(value)}')
 
 
 def compress_features(
