@@ -734,7 +734,7 @@ def create_dummy_batch(size: int) -> features.BatchDict:
 def parallel_featurisation(
     fold_input: folding_input.Input,
     buckets: Sequence[int] | None,
-    ccd: dict[str, chemical_components.ChemicalComponent],
+    ccd: dict,
     num_workers: int | None = None
 ) -> list[features.BatchDict]:
     """并行处理特征化
@@ -751,25 +751,21 @@ def parallel_featurisation(
     print(f'Running parallel featurisation with {num_workers} workers')
     
     with multiprocessing.Pool(num_workers) as pool:
-        # 将输入分成多个批次
         featurisation_args = [
             (fold_input, seed, buckets, ccd)
             for seed in fold_input.rng_seeds
         ]
-        
-        # 并行处理每个批次
         results = pool.starmap(
             featurise_single_input,
             featurisation_args
         )
-        
     return results
 
 def featurise_single_input(
     fold_input: folding_input.Input,
     seed: int,
     buckets: Sequence[int] | None,
-    ccd: dict[str, chemical_components.ChemicalComponent],
+    ccd: dict,
 ) -> features.BatchDict:
     """处理单个输入的特征化
     
@@ -779,13 +775,12 @@ def featurise_single_input(
         buckets: bucket大小序列
         ccd: 化学组分字典
     """
-    # 创建单个seed的fold input
     single_seed_input = fold_input.with_single_seed(seed)
     return featurisation.featurise_input(
         fold_input=single_seed_input,
         buckets=buckets,
         ccd=ccd,
-        verbose=False  # 避免并行时的输出混乱
+        verbose=False
     )
 
 class FeatureCache:
@@ -848,7 +843,7 @@ class FeatureCache:
 def optimize_feature_preprocessing(
     fold_input: folding_input.Input,
     buckets: Sequence[int] | None,
-    ccd: dict[str, chemical_components.ChemicalComponent],
+    ccd: dict,
 ) -> features.BatchDict:
     """优化特征预处理
     
