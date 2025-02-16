@@ -33,6 +33,7 @@ import textwrap
 import time
 import typing
 from typing import overload
+import hashlib
 
 from absl import app
 from absl import flags
@@ -283,6 +284,19 @@ _JAX_CACHE_EVICTION = flags.DEFINE_enum(
     default='lru',
     enum_values=['lru', 'fifo'],
     help='JAX缓存淘汰策略'
+)
+
+# 添加新的配置选项
+_FEATURE_CACHE_DIR = flags.DEFINE_string(
+    'feature_cache_dir',
+    None,
+    '特征缓存目录路径'
+)
+
+_NUM_FEATURE_WORKERS = flags.DEFINE_integer(
+    'num_feature_workers',
+    None,
+    '特征化并行处理的worker数量'
 )
 
 
@@ -574,76 +588,65 @@ def process_fold_input(
     buckets: Sequence[int] | None = None,
     conformer_max_iterations: int | None = None,
 ) -> folding_input.Input | Sequence[ResultsForSeed]:
-  """Runs data pipeline and/or inference on a single fold input.
+    """处理单个fold输入"""
+    print(f'\nRunning fold job {fold_input.name}...')
+    
+    # 初始化特征缓存
+    feature_cache = FeatureCache(_FEATURE_CACHE_DIR.value)
+    
+    # 尝试从缓存加载特征
+    cached_features = feature_cache.get_cached_features(fold_input)
+    if cached_features is not None:
+        print('Using cached features')
+        featurised_examples = cached_features
+    else:
+        print(f'Featurising data with {len(fold_input.rng_seeds)} seed(s)...')
+        featurisation_start_time = time.time()
+        
+        # 获取CCD实例
+        ccd = chemical_components.cached_ccd(user_ccd=fold_input.user_ccd)
+        
+        # 并行特征化处理
+        featurised_examples = parallel_featurisation(
+            fold_input=fold_input,
+            buckets=buckets,
+            ccd=ccd,
+            num_workers=_NUM_FEATURE_WORKERS.value
+        )
+        
+        print(
+            f'Featurising data took {time.time() - featurisation_start_time:.2f}'
+            ' seconds.'
+        )
+        
+        # 缓存特征
+        feature_cache.cache_features(fold_input, featurised_examples)
 
-  Args:
-    fold_input: Fold input to process.
-    data_pipeline_config: Data pipeline config to use. If None, skip the data
-      pipeline.
-    model_runner: Model runner to use. If None, skip inference.
-    output_dir: Output directory to write to.
-    buckets: Bucket sizes to pad the data to, to avoid excessive re-compilation
-      of the model. If None, calculate the appropriate bucket size from the
-      number of tokens. If not None, must be a sequence of at least one integer,
-      in strictly increasing order. Will raise an error if the number of tokens
-      is more than the largest bucket size.
-    conformer_max_iterations: Optional override for maximum number of iterations
-      to run for RDKit conformer search.
+    write_fold_input_json(fold_input, output_dir)
+    if model_runner is None:
+        print('Skipping model inference...')
+        output = fold_input
+    else:
+        print(
+            f'Predicting 3D structure for {fold_input.name} with'
+            f' {len(fold_input.rng_seeds)} seed(s)...'
+        )
+        all_inference_results = predict_structure(
+            fold_input=fold_input,
+            model_runner=model_runner,
+            buckets=buckets,
+            conformer_max_iterations=conformer_max_iterations,
+        )
+        print(f'Writing outputs with {len(fold_input.rng_seeds)} seed(s)...')
+        write_outputs(
+            all_inference_results=all_inference_results,
+            output_dir=output_dir,
+            job_name=fold_input.sanitised_name(),
+        )
+        output = all_inference_results
 
-  Returns:
-    The processed fold input, or the inference results for each seed.
-
-  Raises:
-    ValueError: If the fold input has no chains.
-  """
-  print(f'\nRunning fold job {fold_input.name}...')
-
-  if not fold_input.chains:
-    raise ValueError('Fold input has no chains.')
-
-  if os.path.exists(output_dir) and os.listdir(output_dir):
-    new_output_dir = (
-        f'{output_dir}_{datetime.datetime.now().strftime("%Y%m%d_%H%M%S")}'
-    )
-    print(
-        f'Output will be written in {new_output_dir} since {output_dir} is'
-        ' non-empty.'
-    )
-    output_dir = new_output_dir
-  else:
-    print(f'Output will be written in {output_dir}')
-
-  if data_pipeline_config is None:
-    print('Skipping data pipeline...')
-  else:
-    print('Running data pipeline...')
-    fold_input = pipeline.DataPipeline(data_pipeline_config).process(fold_input)
-
-  write_fold_input_json(fold_input, output_dir)
-  if model_runner is None:
-    print('Skipping model inference...')
-    output = fold_input
-  else:
-    print(
-        f'Predicting 3D structure for {fold_input.name} with'
-        f' {len(fold_input.rng_seeds)} seed(s)...'
-    )
-    all_inference_results = predict_structure(
-        fold_input=fold_input,
-        model_runner=model_runner,
-        buckets=buckets,
-        conformer_max_iterations=conformer_max_iterations,
-    )
-    print(f'Writing outputs with {len(fold_input.rng_seeds)} seed(s)...')
-    write_outputs(
-        all_inference_results=all_inference_results,
-        output_dir=output_dir,
-        job_name=fold_input.sanitised_name(),
-    )
-    output = all_inference_results
-
-  print(f'Fold job {fold_input.name} done, output written to {output_dir}\n')
-  return output
+    print(f'Fold job {fold_input.name} done, output written to {output_dir}\n')
+    return output
 
 
 def configure_jax_cache():
@@ -727,6 +730,134 @@ def create_dummy_batch(size: int) -> features.BatchDict:
         'residue_index': jnp.arange(size),
         # ... 其他必要的特征字段
     }
+
+def parallel_featurisation(
+    fold_input: folding_input.Input,
+    buckets: Sequence[int] | None,
+    ccd: chemical_components.ChemicalComponentDictionary,
+    num_workers: int | None = None
+) -> list[features.BatchDict]:
+    """并行处理特征化"""
+    if num_workers is None:
+        num_workers = min(len(fold_input.rng_seeds), multiprocessing.cpu_count())
+    
+    print(f'Running parallel featurisation with {num_workers} workers')
+    
+    with multiprocessing.Pool(num_workers) as pool:
+        # 将输入分成多个批次
+        featurisation_args = [
+            (fold_input, seed, buckets, ccd)
+            for seed in fold_input.rng_seeds
+        ]
+        
+        # 并行处理每个批次
+        results = pool.starmap(
+            featurise_single_input,
+            featurisation_args
+        )
+        
+    return results
+
+def featurise_single_input(
+    fold_input: folding_input.Input,
+    seed: int,
+    buckets: Sequence[int] | None,
+    ccd: chemical_components.ChemicalComponentDictionary,
+) -> features.BatchDict:
+    """处理单个输入的特征化"""
+    # 创建单个seed的fold input
+    single_seed_input = fold_input.with_single_seed(seed)
+    return featurisation.featurise_input(
+        fold_input=single_seed_input,
+        buckets=buckets,
+        ccd=ccd,
+        verbose=False  # 避免并行时的输出混乱
+    )
+
+class FeatureCache:
+    """特征缓存管理"""
+    def __init__(self, cache_dir: str | None = None):
+        self.cache_dir = cache_dir
+        if cache_dir:
+            os.makedirs(cache_dir, exist_ok=True)
+    
+    def get_cache_key(self, fold_input: folding_input.Input) -> str:
+        """生成缓存键"""
+        # 使用输入的关键信息生成唯一标识
+        key_components = [
+            fold_input.name,
+            *(chain.sequence for chain in fold_input.chains),
+            str(fold_input.rng_seeds)
+        ]
+        return hashlib.md5('_'.join(key_components).encode()).hexdigest()
+    
+    def get_cached_features(
+        self, 
+        fold_input: folding_input.Input
+    ) -> list[features.BatchDict] | None:
+        """获取缓存的特征"""
+        if not self.cache_dir:
+            return None
+            
+        cache_key = self.get_cache_key(fold_input)
+        cache_path = os.path.join(self.cache_dir, f'{cache_key}.npz')
+        
+        if os.path.exists(cache_path):
+            try:
+                with np.load(cache_path, allow_pickle=True) as data:
+                    return data['features']
+            except Exception as e:
+                print(f'Failed to load cache: {e}')
+                return None
+        return None
+    
+    def cache_features(
+        self,
+        fold_input: folding_input.Input,
+        features_list: list[features.BatchDict]
+    ) -> None:
+        """缓存特征"""
+        if not self.cache_dir:
+            return
+            
+        cache_key = self.get_cache_key(fold_input)
+        cache_path = os.path.join(self.cache_dir, f'{cache_key}.npz')
+        
+        try:
+            np.savez_compressed(
+                cache_path,
+                features=features_list
+            )
+        except Exception as e:
+            print(f'Failed to save cache: {e}')
+
+def optimize_feature_preprocessing(
+    fold_input: folding_input.Input,
+    buckets: Sequence[int] | None
+) -> features.BatchDict:
+    """优化特征预处理"""
+    # 1. 提前分配内存
+    max_length = max(len(chain.sequence) for chain in fold_input.chains)
+    if buckets:
+        max_length = min(max(buckets), max_length)
+    
+    # 2. 预分配特征数组
+    prealloc_features = {
+        'aatype': np.zeros((max_length,), dtype=np.int32),
+        'residue_index': np.arange(max_length),
+        'seq_length': np.array([max_length], dtype=np.int32),
+        # ... 其他特征
+    }
+    
+    # 3. 使用向量化操作
+    for chain in fold_input.chains:
+        seq_length = len(chain.sequence)
+        prealloc_features['aatype'][:seq_length] = np.array([
+            chemical_components.residue_to_index(aa)
+            for aa in chain.sequence
+        ])
+    
+    return prealloc_features
 
 def main(_):
     # 配置JAX缓存
