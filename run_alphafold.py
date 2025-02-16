@@ -19,6 +19,12 @@ if received directly from Google. Use is subject to terms of use available at
 https://github.com/google-deepmind/alphafold3/blob/main/WEIGHTS_TERMS_OF_USE.md
 """
 
+import os
+# 在导入jax之前设置环境变量
+os.environ['JAX_PLATFORMS'] = 'cuda'  # 只使用CUDA
+os.environ['JAX_DISABLE_MOST_OPTIMIZATIONS'] = '0'  # 启用优化
+os.environ['XLA_PYTHON_CLIENT_ALLOCATOR'] = 'platform'  # 使用平台默认内存分配器
+
 from collections.abc import Callable, Sequence
 import csv
 import dataclasses
@@ -507,31 +513,22 @@ def batch_process_seeds(args_batch):
     
     # 批量推理
     try:
-        # 将examples堆叠成批处理形式 - 使用新的API
+        # 将examples转换为jax数组
         try:
-            # 尝试使用新版本API
             from jax import tree
             batched_examples = tree.map(
-                lambda *x: jnp.stack(x),
+                lambda *x: jnp.asarray(jnp.stack(x)),  # 确保转换为jax数组
                 *examples
             )
         except ImportError:
-            # 回退到旧版本API
             from jax import tree_util
             batched_examples = tree_util.tree_map(
-                lambda *x: jnp.stack(x),
+                lambda *x: jnp.asarray(jnp.stack(x)),  # 确保转换为jax数组
                 *examples
             )
         
-        # 批量运行推理前清理GPU内存
-        try:
-            import gc
-            import torch
-            gc.collect()
-            torch.cuda.empty_cache()
-            jax.clear_caches()
-        except:
-            pass
+        # 清理GPU内存
+        clear_gpu_memory()
             
         # 批量运行推理
         batch_results = model_runner.run_inference(batched_examples, rng_keys)
@@ -546,7 +543,7 @@ def batch_process_seeds(args_batch):
             print(f'Extracting inference results for seed {seed}...')
             extract_start = time.time()
             
-            # 从批处理结果中提取单个结果 - 使用新的API
+            # 从批处理结果中提取单个结果
             try:
                 single_result = tree.map(lambda x: x[i], batch_results)
             except ImportError:
@@ -575,12 +572,7 @@ def batch_process_seeds(args_batch):
             )
             
             # 每处理完一个结果就清理一次内存
-            try:
-                gc.collect()
-                torch.cuda.empty_cache()
-                jax.clear_caches()
-            except:
-                pass
+            clear_gpu_memory()
             
     except Exception as e:
         print(f'Error in batch processing: {e}')
