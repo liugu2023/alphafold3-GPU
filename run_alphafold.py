@@ -34,6 +34,11 @@ import time
 import typing
 from typing import overload, Optional
 import tempfile
+from contextlib import contextmanager
+from typing import Iterator
+import hashlib
+import numpy as np
+import scipy.sparse
 
 from absl import app
 from absl import flags
@@ -52,7 +57,6 @@ from alphafold3.model.components import utils
 import haiku as hk
 import jax
 from jax import numpy as jnp
-import numpy as np
 import jax.profiler
 
 
@@ -547,63 +551,29 @@ def predict_structure(
     buckets: Sequence[int] | None = None,
     conformer_max_iterations: int | None = None,
 ) -> Sequence[ResultsForSeed]:
-    """Runs the full inference pipeline to predict structures for each seed."""
-
+    """优化特征提取的并行处理."""
     print(f'Featurising data with {len(fold_input.rng_seeds)} seed(s)...')
     featurisation_start_time = time.time()
-    ccd = chemical_components.cached_ccd(user_ccd=fold_input.user_ccd)
-    featurised_examples = featurisation.featurise_input(
-        fold_input=fold_input,
-        buckets=buckets,
-        ccd=ccd,
-        verbose=True,
-        conformer_max_iterations=conformer_max_iterations,
-    )
+    
+    # 添加并行处理
+    with multiprocessing.Pool() as pool:
+        # 准备特征化参数
+        featurisation_args = [
+            (fold_input, buckets, conformer_max_iterations)
+            for _ in range(len(fold_input.rng_seeds))
+        ]
+        
+        # 并行执行特征化
+        featurised_examples = pool.starmap(
+            featurisation.featurise_input_single,
+            featurisation_args
+        )
+    
     print(
         f'Featurising data with {len(fold_input.rng_seeds)} seed(s) took'
         f' {time.time() - featurisation_start_time:.2f} seconds.'
     )
-    print(
-        'Running model inference and extracting output structure samples with'
-        f' {len(fold_input.rng_seeds)} seed(s)...'
-    )
-    all_inference_start_time = time.time()
-    all_inference_results = []
-    for seed, example in zip(fold_input.rng_seeds, featurised_examples):
-        print(f'Running model inference with seed {seed}...')
-        inference_start_time = time.time()
-        rng_key = jax.random.PRNGKey(seed)
-        result = model_runner.run_inference(example, rng_key)
-        print(
-            f'Running model inference with seed {seed} took'
-            f' {time.time() - inference_start_time:.2f} seconds.'
-        )
-        print(f'Extracting inference results with seed {seed}...')
-        extract_structures = time.time()
-        inference_results, embeddings = (
-            model_runner.extract_inference_results_and_maybe_embeddings(
-                batch=example, result=result, target_name=fold_input.name
-            )
-        )
-        print(
-            f'Extracting {len(inference_results)} inference samples with'
-            f' seed {seed} took {time.time() - extract_structures:.2f} seconds.'
-        )
-
-        all_inference_results.append(
-            ResultsForSeed(
-                seed=seed,
-                inference_results=inference_results,
-                full_fold_input=fold_input,
-                embeddings=embeddings,
-            )
-        )
-    print(
-        'Running model inference and extracting output structures with'
-        f' {len(fold_input.rng_seeds)} seed(s) took'
-        f' {time.time() - all_inference_start_time:.2f} seconds.'
-    )
-    return all_inference_results
+    return featurised_examples
 
 
 def write_fold_input_json(
@@ -708,6 +678,127 @@ def replace_db_dir(path_with_db_dir: str, db_dirs: Sequence[str]) -> str:
     return path_with_db_dir
 
 
+# 添加时间统计工具
+@contextmanager
+def timing(description: str) -> Iterator[None]:
+    """用于统计代码块执行时间的上下文管理器."""
+    start = time.time()
+    yield
+    elapsed = time.time() - start
+    print(f'{description} took {elapsed:.2f} seconds')
+
+
+class FeatureCache:
+    """特征缓存管理."""
+    
+    def __init__(self, cache_dir: str):
+        self.cache_dir = pathlib.Path(cache_dir)
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        
+    def get_cache_key(self, fold_input: folding_input.Input) -> str:
+        """生成缓存键."""
+        # 使用输入的关键信息生成唯一标识
+        input_hash = hashlib.sha256(
+            fold_input.to_json().encode()
+        ).hexdigest()
+        return input_hash
+        
+    def get_cached_features(
+        self,
+        fold_input: folding_input.Input
+    ) -> Optional[features.BatchDict]:
+        """获取缓存的特征."""
+        cache_key = self.get_cache_key(fold_input)
+        cache_path = self.cache_dir / f"{cache_key}.npz"
+        
+        if cache_path.exists():
+            return np.load(cache_path, allow_pickle=True)
+        return None
+        
+    def cache_features(
+        self,
+        fold_input: folding_input.Input,
+        featurised_example: features.BatchDict
+    ) -> None:
+        """缓存特征."""
+        cache_key = self.get_cache_key(fold_input)
+        cache_path = self.cache_dir / f"{cache_key}.npz"
+        np.savez_compressed(cache_path, **featurised_example)
+
+
+def optimize_features(
+    featurised_example: features.BatchDict,
+    dtype: jnp.dtype = jnp.float32
+) -> features.BatchDict:
+    """优化特征数据类型和内存布局."""
+    optimized = {}
+    
+    for key, value in featurised_example.items():
+        if isinstance(value, np.ndarray):
+            # 优化数据类型
+            if value.dtype in (np.float64, np.float32):
+                value = value.astype(dtype)
+            
+            # 优化内存布局
+            if not value.flags['C_CONTIGUOUS']:
+                value = np.ascontiguousarray(value)
+                
+        optimized[key] = value
+        
+    return optimized
+
+
+def validate_features(
+    featurised_example: features.BatchDict
+) -> None:
+    """验证特征的完整性和正确性."""
+    required_features = {
+        'aatype', 'residue_index', 'seq_length',
+        'template_aatype', 'template_all_atom_positions'
+    }
+    
+    # 检查必需特征
+    missing_features = required_features - set(featurised_example.keys())
+    if missing_features:
+        raise ValueError(f'Missing required features: {missing_features}')
+        
+    # 验证特征维度
+    seq_length = featurised_example['seq_length']
+    for key, value in featurised_example.items():
+        if isinstance(value, np.ndarray):
+            if value.shape[0] != seq_length:
+                raise ValueError(
+                    f'Feature {key} has incorrect first dimension:'
+                    f' {value.shape[0]} != {seq_length}'
+                )
+
+
+def compress_features(
+    featurised_example: features.BatchDict,
+    compression_level: int = 1
+) -> features.BatchDict:
+    """压缩特征以减少内存使用."""
+    compressed = {}
+    
+    for key, value in featurised_example.items():
+        if isinstance(value, np.ndarray):
+            # 对精度要求不高的特征进行降精度
+            if value.dtype == np.float64:
+                value = value.astype(np.float32)
+            elif value.dtype == np.float32 and compression_level > 1:
+                value = value.astype(np.float16)
+                
+            # 对稀疏特征进行压缩
+            if compression_level > 2 and value.size > 1000:
+                sparsity = np.count_nonzero(value) / value.size
+                if sparsity < 0.1:
+                    value = scipy.sparse.csr_matrix(value)
+                    
+        compressed[key] = value
+        
+    return compressed
+
+
 def process_fold_input(
     fold_input: folding_input.Input,
     data_pipeline_config: pipeline.DataPipelineConfig | None,
@@ -716,52 +807,40 @@ def process_fold_input(
     buckets: Sequence[int] | None = None,
     conformer_max_iterations: int | None = None,
 ) -> folding_input.Input | Sequence[ResultsForSeed]:
-    """Runs data pipeline and/or inference on a single fold input.
-
-    Args:
-        fold_input: Fold input to process.
-        data_pipeline_config: Data pipeline config to use. If None, skip the data
-            pipeline.
-        model_runner: Model runner to use. If None, skip inference.
-        output_dir: Output directory to write to.
-        buckets: Bucket sizes to pad the data to, to avoid excessive re-compilation
-            of the model. If None, calculate the appropriate bucket size from the
-            number of tokens. If not None, must be a sequence of at least one integer,
-            in strictly increasing order. Will raise an error if the number of tokens
-            is more than the largest bucket size.
-        conformer_max_iterations: Optional override for maximum number of iterations
-            to run for RDKit conformer search.
-
-    Returns:
-        The processed fold input, or the inference results for each seed.
-
-    Raises:
-        ValueError: If the fold input has no chains.
-    """
+    """Runs data pipeline and/or inference on a single fold input."""
     print(f'\nRunning fold job {fold_input.name}...')
+    job_start_time = time.time()
 
     if not fold_input.chains:
         raise ValueError('Fold input has no chains.')
 
-    if os.path.exists(output_dir) and os.listdir(output_dir):
-        new_output_dir = (
-            f'{output_dir}_{datetime.datetime.now().strftime("%Y%m%d_%H%M%S")}'
-        )
-        print(
-            f'Output will be written in {new_output_dir} since {output_dir} is'
-            ' non-empty.'
-        )
-        output_dir = new_output_dir
-    else:
-        print(f'Output will be written in {output_dir}')
+    # 输出目录处理
+    with timing('Output directory preparation'):
+        if os.path.exists(output_dir) and os.listdir(output_dir):
+            new_output_dir = (
+                f'{output_dir}_{datetime.datetime.now().strftime("%Y%m%d_%H%M%S")}'
+            )
+            print(
+                f'Output will be written in {new_output_dir} since {output_dir} is'
+                ' non-empty.'
+            )
+            output_dir = new_output_dir
+        else:
+            print(f'Output will be written in {output_dir}')
 
+    # 数据管道处理
     if data_pipeline_config is None:
         print('Skipping data pipeline...')
     else:
         print('Running data pipeline...')
-        fold_input = pipeline.DataPipeline(data_pipeline_config).process(fold_input)
+        with timing('Data pipeline'):
+            fold_input = pipeline.DataPipeline(data_pipeline_config).process(fold_input)
 
-    write_fold_input_json(fold_input, output_dir)
+    # 写入输入JSON
+    with timing('Writing input JSON'):
+        write_fold_input_json(fold_input, output_dir)
+
+    # 模型推理
     if model_runner is None:
         print('Skipping model inference...')
         output = fold_input
@@ -770,25 +849,35 @@ def process_fold_input(
             f'Predicting 3D structure for {fold_input.name} with'
             f' {len(fold_input.rng_seeds)} seed(s)...'
         )
-        all_inference_results = predict_structure(
-            fold_input=fold_input,
-            model_runner=model_runner,
-            buckets=buckets,
-            conformer_max_iterations=conformer_max_iterations,
-        )
+        with timing('Structure prediction'):
+            all_inference_results = predict_structure(
+                fold_input=fold_input,
+                model_runner=model_runner,
+                buckets=buckets,
+                conformer_max_iterations=conformer_max_iterations,
+            )
+        
         print(f'Writing outputs with {len(fold_input.rng_seeds)} seed(s)...')
-        write_outputs(
-            all_inference_results=all_inference_results,
-            output_dir=output_dir,
-            job_name=fold_input.sanitised_name(),
-        )
+        with timing('Writing outputs'):
+            write_outputs(
+                all_inference_results=all_inference_results,
+                output_dir=output_dir,
+                job_name=fold_input.sanitised_name(),
+            )
         output = all_inference_results
 
-    print(f'Fold job {fold_input.name} done, output written to {output_dir}\n')
+    total_time = time.time() - job_start_time
+    print(
+        f'Fold job {fold_input.name} completed in {total_time:.2f} seconds,'
+        f' output written to {output_dir}\n'
+    )
     return output
 
 
 def main(_):
+    main_start_time = time.time()
+    total_jobs = 0
+    
     if _JAX_COMPILATION_CACHE_DIR.value is not None:
         jax.config.update(
             'jax_compilation_cache_dir', _JAX_COMPILATION_CACHE_DIR.value
@@ -826,115 +915,125 @@ def main(_):
         raise
 
     if _RUN_INFERENCE.value:
-        # Fail early on incompatible devices, but only if we're running inference.
-        gpu_devices = jax.local_devices(backend='gpu')
-        if gpu_devices:
-            compute_capability = float(
-                gpu_devices[_GPU_DEVICE.value].compute_capability
-            )
-            if compute_capability < 6.0:
-                raise ValueError(
-                    'AlphaFold 3 requires at least GPU compute capability 6.0 (see'
-                    ' https://developer.nvidia.com/cuda-gpus).'
+        with timing('GPU device check'):
+            # Fail early on incompatible devices, but only if we're running inference.
+            gpu_devices = jax.local_devices(backend='gpu')
+            if gpu_devices:
+                compute_capability = float(
+                    gpu_devices[_GPU_DEVICE.value].compute_capability
                 )
-            elif 7.0 <= compute_capability < 8.0:
-                xla_flags = os.environ.get('XLA_FLAGS')
-                required_flag = '--xla_disable_hlo_passes=custom-kernel-fusion-rewriter'
-                if not xla_flags or required_flag not in xla_flags:
+                if compute_capability < 6.0:
                     raise ValueError(
-                        'For devices with GPU compute capability 7.x (see'
-                        ' https://developer.nvidia.com/cuda-gpus) the ENV XLA_FLAGS must'
-                        f' include "{required_flag}".'
+                        'AlphaFold 3 requires at least GPU compute capability 6.0 (see'
+                        ' https://developer.nvidia.com/cuda-gpus).'
                     )
-                if _FLASH_ATTENTION_IMPLEMENTATION.value != 'xla':
-                    raise ValueError(
-                        'For devices with GPU compute capability 7.x (see'
-                        ' https://developer.nvidia.com/cuda-gpus) the'
-                        ' --flash_attention_implementation must be set to "xla".'
-                    )
+                elif 7.0 <= compute_capability < 8.0:
+                    xla_flags = os.environ.get('XLA_FLAGS')
+                    required_flag = '--xla_disable_hlo_passes=custom-kernel-fusion-rewriter'
+                    if not xla_flags or required_flag not in xla_flags:
+                        raise ValueError(
+                            'For devices with GPU compute capability 7.x (see'
+                            ' https://developer.nvidia.com/cuda-gpus) the ENV XLA_FLAGS must'
+                            f' include "{required_flag}".'
+                        )
+                    if _FLASH_ATTENTION_IMPLEMENTATION.value != 'xla':
+                        raise ValueError(
+                            'For devices with GPU compute capability 7.x (see'
+                            ' https://developer.nvidia.com/cuda-gpus) the'
+                            ' --flash_attention_implementation must be set to "xla".'
+                        )
 
-    notice = textwrap.wrap(
-        'Running AlphaFold 3. Please note that standard AlphaFold 3 model'
-        ' parameters are only available under terms of use provided at'
-        ' https://github.com/google-deepmind/alphafold3/blob/main/WEIGHTS_TERMS_OF_USE.md.'
-        ' If you do not agree to these terms and are using AlphaFold 3 derived'
-        ' model parameters, cancel execution of AlphaFold 3 inference with'
-        ' CTRL-C, and do not use the model parameters.',
-        break_long_words=False,
-        break_on_hyphens=False,
-        width=80,
-    )
-    print('\n' + '\n'.join(notice) + '\n')
+    with timing('Model notice display'):
+        notice = textwrap.wrap(
+            'Running AlphaFold 3. Please note that standard AlphaFold 3 model'
+            ' parameters are only available under terms of use provided at'
+            ' https://github.com/google-deepmind/alphafold3/blob/main/WEIGHTS_TERMS_OF_USE.md.'
+            ' If you do not agree to these terms and are using AlphaFold 3 derived'
+            ' model parameters, cancel execution of AlphaFold 3 inference with'
+            ' CTRL-C, and do not use the model parameters.',
+            break_long_words=False,
+            break_on_hyphens=False,
+            width=80,
+        )
+        print('\n' + '\n'.join(notice) + '\n')
 
     if _RUN_DATA_PIPELINE.value:
-        expand_path = lambda x: replace_db_dir(x, DB_DIR.value)
-        max_template_date = datetime.date.fromisoformat(_MAX_TEMPLATE_DATE.value)
-        data_pipeline_config = pipeline.DataPipelineConfig(
-            jackhmmer_binary_path=_JACKHMMER_BINARY_PATH.value,
-            nhmmer_binary_path=_NHMMER_BINARY_PATH.value,
-            hmmalign_binary_path=_HMMALIGN_BINARY_PATH.value,
-            hmmsearch_binary_path=_HMMSEARCH_BINARY_PATH.value,
-            hmmbuild_binary_path=_HMMBUILD_BINARY_PATH.value,
-            small_bfd_database_path=expand_path(_SMALL_BFD_DATABASE_PATH.value),
-            mgnify_database_path=expand_path(_MGNIFY_DATABASE_PATH.value),
-            uniprot_cluster_annot_database_path=expand_path(
-                _UNIPROT_CLUSTER_ANNOT_DATABASE_PATH.value
-            ),
-            uniref90_database_path=expand_path(_UNIREF90_DATABASE_PATH.value),
-            ntrna_database_path=expand_path(_NTRNA_DATABASE_PATH.value),
-            rfam_database_path=expand_path(_RFAM_DATABASE_PATH.value),
-            rna_central_database_path=expand_path(_RNA_CENTRAL_DATABASE_PATH.value),
-            pdb_database_path=expand_path(_PDB_DATABASE_PATH.value),
-            seqres_database_path=expand_path(_SEQRES_DATABASE_PATH.value),
-            jackhmmer_n_cpu=_JACKHMMER_N_CPU.value,
-            nhmmer_n_cpu=_NHMMER_N_CPU.value,
-            max_template_date=max_template_date,
-        )
-    else:
-        data_pipeline_config = None
+        with timing('Data pipeline configuration'):
+            expand_path = lambda x: replace_db_dir(x, DB_DIR.value)
+            max_template_date = datetime.date.fromisoformat(_MAX_TEMPLATE_DATE.value)
+            data_pipeline_config = pipeline.DataPipelineConfig(
+                jackhmmer_binary_path=_JACKHMMER_BINARY_PATH.value,
+                nhmmer_binary_path=_NHMMER_BINARY_PATH.value,
+                hmmalign_binary_path=_HMMALIGN_BINARY_PATH.value,
+                hmmsearch_binary_path=_HMMSEARCH_BINARY_PATH.value,
+                hmmbuild_binary_path=_HMMBUILD_BINARY_PATH.value,
+                small_bfd_database_path=expand_path(_SMALL_BFD_DATABASE_PATH.value),
+                mgnify_database_path=expand_path(_MGNIFY_DATABASE_PATH.value),
+                uniprot_cluster_annot_database_path=expand_path(
+                    _UNIPROT_CLUSTER_ANNOT_DATABASE_PATH.value
+                ),
+                uniref90_database_path=expand_path(_UNIREF90_DATABASE_PATH.value),
+                ntrna_database_path=expand_path(_NTRNA_DATABASE_PATH.value),
+                rfam_database_path=expand_path(_RFAM_DATABASE_PATH.value),
+                rna_central_database_path=expand_path(_RNA_CENTRAL_DATABASE_PATH.value),
+                pdb_database_path=expand_path(_PDB_DATABASE_PATH.value),
+                seqres_database_path=expand_path(_SEQRES_DATABASE_PATH.value),
+                jackhmmer_n_cpu=_JACKHMMER_N_CPU.value,
+                nhmmer_n_cpu=_NHMMER_N_CPU.value,
+                max_template_date=max_template_date,
+            )
+        else:
+            data_pipeline_config = None
 
     if _RUN_INFERENCE.value:
-        devices = jax.local_devices(backend='gpu')
-        print(
-            f'Found local devices: {devices}, using device {_GPU_DEVICE.value}:'
-            f' {devices[_GPU_DEVICE.value]}'
-        )
+        with timing('Model initialization'):
+            devices = jax.local_devices(backend='gpu')
+            print(
+                f'Found local devices: {devices}, using device {_GPU_DEVICE.value}:'
+                f' {devices[_GPU_DEVICE.value]}'
+            )
 
-        print('Building model from scratch...')
-        model_runner = ModelRunner(
-            config=make_model_config(
-                flash_attention_implementation=typing.cast(
-                    attention.Implementation, _FLASH_ATTENTION_IMPLEMENTATION.value
+            print('Building model from scratch...')
+            model_runner = ModelRunner(
+                config=make_model_config(
+                    flash_attention_implementation=typing.cast(
+                        attention.Implementation, _FLASH_ATTENTION_IMPLEMENTATION.value
+                    ),
+                    num_diffusion_samples=_NUM_DIFFUSION_SAMPLES.value,
+                    num_recycles=_NUM_RECYCLES.value,
+                    return_embeddings=_SAVE_EMBEDDINGS.value,
                 ),
-                num_diffusion_samples=_NUM_DIFFUSION_SAMPLES.value,
-                num_recycles=_NUM_RECYCLES.value,
-                return_embeddings=_SAVE_EMBEDDINGS.value,
-            ),
-            device=devices[_GPU_DEVICE.value],
-            model_dir=pathlib.Path(MODEL_DIR.value),
-        )
-        # Check we can load the model parameters before launching anything.
-        print('Checking that model parameters can be loaded...')
-        _ = model_runner.model_params
+                device=devices[_GPU_DEVICE.value],
+                model_dir=pathlib.Path(MODEL_DIR.value),
+            )
+            print('Checking that model parameters can be loaded...')
+            _ = model_runner.model_params
     else:
         model_runner = None
 
-    num_fold_inputs = 0
+    # 处理每个输入
     for fold_input in fold_inputs:
         if _NUM_SEEDS.value is not None:
             print(f'Expanding fold job {fold_input.name} to {_NUM_SEEDS.value} seeds')
             fold_input = fold_input.with_multiple_seeds(_NUM_SEEDS.value)
-        process_fold_input(
-            fold_input=fold_input,
-            data_pipeline_config=data_pipeline_config,
-            model_runner=model_runner,
-            output_dir=os.path.join(_OUTPUT_DIR.value, fold_input.sanitised_name()),
-            buckets=tuple(int(bucket) for bucket in _BUCKETS.value),
-            conformer_max_iterations=_CONFORMER_MAX_ITERATIONS.value,
-        )
-        num_fold_inputs += 1
+            
+        with timing(f'Processing fold job {fold_input.name}'):
+            process_fold_input(
+                fold_input=fold_input,
+                data_pipeline_config=data_pipeline_config,
+                model_runner=model_runner,
+                output_dir=os.path.join(_OUTPUT_DIR.value, fold_input.sanitised_name()),
+                buckets=tuple(int(bucket) for bucket in _BUCKETS.value),
+                conformer_max_iterations=_CONFORMER_MAX_ITERATIONS.value,
+            )
+        total_jobs += 1
 
-    print(f'Done running {num_fold_inputs} fold jobs.')
+    total_time = time.time() - main_start_time
+    print(
+        f'\nAll jobs completed in {total_time:.2f} seconds\n'
+        f'Total number of jobs processed: {total_jobs}\n'
+        f'Average time per job: {total_time/total_jobs:.2f} seconds'
+    )
 
 
 if __name__ == '__main__':
