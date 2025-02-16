@@ -789,14 +789,23 @@ def create_dummy_batch(size: int) -> features.BatchDict:
         'extra_msa_mask': jnp.ones((1, size), dtype=jnp.float32),
         'extra_msa_row_mask': jnp.ones((1,), dtype=jnp.float32),
         'extra_deletion_matrix': jnp.zeros((1, size), dtype=jnp.float32),
+        
+        # Token相关特征
+        'token_index': jnp.arange(size, dtype=jnp.int32),  # 添加token索引
+        'token_type': jnp.zeros((size,), dtype=jnp.int32),  # token类型
+        'token_chain_index': jnp.zeros((size,), dtype=jnp.int32),  # token所属链的索引
+        'token_mask': jnp.ones((size,), dtype=jnp.float32),  # token掩码
+        'token_residue_index': jnp.arange(size, dtype=jnp.int32),  # token残基索引
+        'token_atom_pos': jnp.zeros((size, 37, 3), dtype=jnp.float32),  # token原子位置
+        'token_atom_mask': jnp.ones((size, 37), dtype=jnp.float32),  # token原子掩码
+        'token_gt_positions': jnp.zeros((size, 37, 3), dtype=jnp.float32),  # ground truth位置
+        'token_gt_mask': jnp.ones((size, 37), dtype=jnp.float32),  # ground truth掩码
+        'token_rigid_mask': jnp.ones((size,), dtype=jnp.float32),  # token刚性掩码
+        'token_rigid_transform': jnp.zeros((size, 4, 4), dtype=jnp.float32),  # token刚性变换
     }
     
-    # 添加pair特征
-    batch.update({
-        'pair_mask': jnp.ones((size, size), dtype=jnp.float32),
-        'pair_residue_distances': jnp.zeros((size, size), dtype=jnp.float32),
-        'pair_chain_distances': jnp.zeros((size, size), dtype=jnp.float32),
-    })
+    # 初始化刚性变换矩阵的对角线为1
+    batch['token_rigid_transform'] = batch['token_rigid_transform'].at[:, jnp.arange(4), jnp.arange(4)].set(1.0)
     
     return batch
 
