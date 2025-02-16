@@ -490,50 +490,75 @@ def process_single_seed(args):
     )
 
 def batch_process_seeds(args_batch):
-    """批量处理多个种子的推理任务
-    
-    Args:
-        args_batch: list of tuples, each containing (seed, example, model_runner, fold_input)
-        
-    Returns:
-        list of ResultsForSeed objects
-    """
+    """批量处理多个种子的推理任务"""
     results = []
     batch_size = len(args_batch)
     
     # 准备批处理数据
     seeds = [args[0] for args in args_batch]
     examples = [args[1] for args in args_batch]
-    model_runner = args_batch[0][2]  # 所有任务使用相同的model_runner
-    fold_input = args_batch[0][3]    # 所有任务使用相同的fold_input
+    model_runner = args_batch[0][2]
+    fold_input = args_batch[0][3]
     
     print(f'Running batch inference with seeds {seeds}...')
     inference_start_time = time.time()
     
-    # 创建批量随机密钥
-    rng_keys = jnp.stack([jax.random.PRNGKey(seed) for seed in seeds])
-    
-    # 批量推理
+    # 确保使用jax数组
     try:
-        # 将examples转换为jax数组
+        # 将所有输入转换为device arrays
+        def convert_to_jax(x):
+            if isinstance(x, np.ndarray):
+                return jax.device_put(x)
+            return x
+            
+        # 转换examples中的所有numpy数组为jax数组
         try:
             from jax import tree
+            examples = [
+                tree.map(convert_to_jax, example)
+                for example in examples
+            ]
+        except ImportError:
+            from jax import tree_util
+            examples = [
+                tree_util.tree_map(convert_to_jax, example)
+                for example in examples
+            ]
+            
+        # 创建批量随机密钥并确保在设备上
+        rng_keys = jax.device_put(
+            jnp.stack([jax.random.PRNGKey(seed) for seed in seeds])
+        )
+        
+        # 堆叠并转换为device arrays
+        try:
             batched_examples = tree.map(
-                lambda *x: jnp.asarray(jnp.stack(x)),  # 确保转换为jax数组
+                lambda *x: jax.device_put(jnp.stack(x)),
                 *examples
             )
         except ImportError:
-            from jax import tree_util
             batched_examples = tree_util.tree_map(
-                lambda *x: jnp.asarray(jnp.stack(x)),  # 确保转换为jax数组
+                lambda *x: jax.device_put(jnp.stack(x)),
                 *examples
             )
         
         # 清理GPU内存
         clear_gpu_memory()
             
-        # 批量运行推理
-        batch_results = model_runner.run_inference(batched_examples, rng_keys)
+        # 使用jit包装的推理函数
+        @functools.partial(
+            jax.jit,
+            static_argnames=['batch_size'],  # 标记batch_size为静态参数
+        )
+        def batched_inference(batched_examples, rng_keys, batch_size):
+            return model_runner.run_inference(batched_examples, rng_keys)
+            
+        # 运行批量推理
+        batch_results = batched_inference(
+            batched_examples,
+            rng_keys,
+            batch_size=batch_size
+        )
         
         print(
             f'Batch inference with {batch_size} seeds took'
@@ -547,9 +572,15 @@ def batch_process_seeds(args_batch):
             
             # 从批处理结果中提取单个结果
             try:
-                single_result = tree.map(lambda x: x[i], batch_results)
+                single_result = tree.map(
+                    lambda x: jax.device_get(x[i]),  # 确保转回host内存
+                    batch_results
+                )
             except ImportError:
-                single_result = tree_util.tree_map(lambda x: x[i], batch_results)
+                single_result = tree_util.tree_map(
+                    lambda x: jax.device_get(x[i]),
+                    batch_results
+                )
             
             inference_results, embeddings = (
                 model_runner.extract_inference_results_and_maybe_embeddings(
