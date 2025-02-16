@@ -982,8 +982,8 @@ def main(_):
                 nhmmer_n_cpu=_NHMMER_N_CPU.value,
                 max_template_date=max_template_date,
             )
-        else:
-            data_pipeline_config = None
+    else:
+        data_pipeline_config = None
 
     if _RUN_INFERENCE.value:
         with timing('Model initialization'):
