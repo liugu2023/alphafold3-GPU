@@ -734,10 +734,17 @@ def create_dummy_batch(size: int) -> features.BatchDict:
 def parallel_featurisation(
     fold_input: folding_input.Input,
     buckets: Sequence[int] | None,
-    ccd: chemical_components.ChemicalComponentDictionary,
+    ccd: dict[str, chemical_components.ChemicalComponent],
     num_workers: int | None = None
 ) -> list[features.BatchDict]:
-    """并行处理特征化"""
+    """并行处理特征化
+    
+    Args:
+        fold_input: 输入数据
+        buckets: bucket大小序列
+        ccd: 化学组分字典
+        num_workers: 并行worker数量,默认为min(seed数量, CPU核心数)
+    """
     if num_workers is None:
         num_workers = min(len(fold_input.rng_seeds), multiprocessing.cpu_count())
     
@@ -762,9 +769,16 @@ def featurise_single_input(
     fold_input: folding_input.Input,
     seed: int,
     buckets: Sequence[int] | None,
-    ccd: chemical_components.ChemicalComponentDictionary,
+    ccd: dict[str, chemical_components.ChemicalComponent],
 ) -> features.BatchDict:
-    """处理单个输入的特征化"""
+    """处理单个输入的特征化
+    
+    Args:
+        fold_input: 输入数据
+        seed: 随机种子
+        buckets: bucket大小序列
+        ccd: 化学组分字典
+    """
     # 创建单个seed的fold input
     single_seed_input = fold_input.with_single_seed(seed)
     return featurisation.featurise_input(
@@ -833,9 +847,16 @@ class FeatureCache:
 
 def optimize_feature_preprocessing(
     fold_input: folding_input.Input,
-    buckets: Sequence[int] | None
+    buckets: Sequence[int] | None,
+    ccd: dict[str, chemical_components.ChemicalComponent],
 ) -> features.BatchDict:
-    """优化特征预处理"""
+    """优化特征预处理
+    
+    Args:
+        fold_input: 输入数据
+        buckets: bucket大小序列
+        ccd: 化学组分字典
+    """
     # 1. 提前分配内存
     max_length = max(len(chain.sequence) for chain in fold_input.chains)
     if buckets:
@@ -846,16 +867,26 @@ def optimize_feature_preprocessing(
         'aatype': np.zeros((max_length,), dtype=np.int32),
         'residue_index': np.arange(max_length),
         'seq_length': np.array([max_length], dtype=np.int32),
-        # ... 其他特征
+        'chain_index': np.zeros((max_length,), dtype=np.int32),
+        'residue_mask': np.zeros((max_length,), dtype=np.float32),
     }
     
     # 3. 使用向量化操作
-    for chain in fold_input.chains:
+    current_idx = 0
+    for chain_idx, chain in enumerate(fold_input.chains):
         seq_length = len(chain.sequence)
-        prealloc_features['aatype'][:seq_length] = np.array([
-            chemical_components.residue_to_index(aa)
+        # 转换氨基酸序列到索引
+        aa_indices = np.array([
+            chemical_components.get_residue_index(aa, ccd)
             for aa in chain.sequence
         ])
+        
+        # 批量更新特征
+        prealloc_features['aatype'][current_idx:current_idx + seq_length] = aa_indices
+        prealloc_features['chain_index'][current_idx:current_idx + seq_length] = chain_idx
+        prealloc_features['residue_mask'][current_idx:current_idx + seq_length] = 1.0
+        
+        current_idx += seq_length
     
     return prealloc_features
 
