@@ -821,6 +821,13 @@ def create_dummy_batch(size: int) -> features.BatchDict:
             'transform_pos': jnp.zeros((1, 3), dtype=jnp.float32),
             'transform_rot': jnp.eye(3, dtype=jnp.float32)[None],
         },
+        
+        # 分子类型相关特征
+        'is_protein': jnp.ones((size,), dtype=jnp.bool_),  # 是否为蛋白质
+        'is_rna': jnp.zeros((size,), dtype=jnp.bool_),  # 是否为RNA
+        'is_ligand': jnp.zeros((size,), dtype=jnp.bool_),  # 是否为配体
+        'molecule_type': jnp.zeros((size,), dtype=jnp.int32),  # 分子类型编号
+        'molecule_name': jnp.zeros((size,), dtype=jnp.int32),  # 分子名称编号
     }
     
     # 初始化刚性变换矩阵的对角线为1
