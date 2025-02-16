@@ -594,7 +594,7 @@ def predict_structure(
         featurised_example = optimize_features(featurised_example)
         
         # 特征验证
-        validate_features(featurised_example)
+        validate_features(featurised_example, verbose=False)
         
         # 特征压缩
         featurised_example = compress_features(featurised_example)
@@ -833,7 +833,8 @@ def optimize_features(
 
 
 def validate_features(
-    featurised_example: features.BatchDict | list
+    featurised_example: features.BatchDict | list,
+    verbose: bool = False  # 添加verbose参数控制输出
 ) -> None:
     """验证特征的完整性和正确性."""
     # 如果输入是列表，取第一个元素
@@ -872,8 +873,8 @@ def validate_features(
     seq_length = min(seq_lengths)
     
     # 检查序列长度是否一致
-    unique_lengths = set(int(length) for length in seq_lengths)  # 确保所有长度都是Python整数
-    if len(unique_lengths) > 1:
+    unique_lengths = set(int(length) for length in seq_lengths)
+    if len(unique_lengths) > 1 and verbose:  # 只在verbose模式下输出警告
         print(f'Warning: Different sequence lengths detected: {sorted(unique_lengths)}')
         print(f'Using minimum length: {seq_length}')
         
@@ -885,31 +886,30 @@ def validate_features(
                 continue
                 
             if key in ['aatype', 'residue_index']:
-                # 检查1D特征的维度
                 if shape[0] < seq_length:
                     raise ValueError(
                         f'Feature {key} is too short:'
                         f' {shape[0]} < {seq_length}'
                     )
             elif key.endswith('_all_atom_positions') and len(shape) == 3:
-                # 检查原子位置特征的维度
                 if shape[0] < seq_length:
                     raise ValueError(
                         f'Feature {key} is too short:'
                         f' {shape[0]} < {seq_length}'
                     )
                 
-    # 打印特征统计信息
-    print('\nFeature validation summary:')
-    print(f'Sequence length: {seq_length}')
-    print('Available features:')
-    for key, value in featurised_example.items():
-        if isinstance(value, np.ndarray):
-            print(f'  {key}: shape={value.shape}, dtype={value.dtype}')
-        else:
-            print(f'  {key}: type={type(value)}')
+    # 只在verbose模式下打印特征统计信息
+    if verbose:
+        print('\nFeature validation summary:')
+        print(f'Sequence length: {seq_length}')
+        print('Available features:')
+        for key, value in featurised_example.items():
+            if isinstance(value, np.ndarray):
+                print(f'  {key}: shape={value.shape}, dtype={value.dtype}')
+            else:
+                print(f'  {key}: type={type(value)}')
             
-    return seq_length  # 返回确定的序列长度供后续使用
+    return seq_length
 
 
 def compress_features(
