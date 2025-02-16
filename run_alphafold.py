@@ -723,13 +723,54 @@ def warmup_compilation(
     print(f'Compilation warmup took {time.time() - start_time:.2f} seconds')
 
 def create_dummy_batch(size: int) -> features.BatchDict:
-    """创建指定大小的示例输入用于预热"""
-    # 创建符合模型输入要求的dummy数据
-    return {
+    """创建指定大小的示例输入用于预热
+    
+    Args:
+        size: 序列长度
+        
+    Returns:
+        包含所有必要特征的dummy batch
+    """
+    # 创建基本特征
+    batch = {
         'aatype': jnp.zeros((size,), dtype=jnp.int32),
         'residue_index': jnp.arange(size),
-        # ... 其他必要的特征字段
+        'seq_length': jnp.array([size], dtype=jnp.int32),
+        'chain_index': jnp.zeros((size,), dtype=jnp.int32),
+        'residue_mask': jnp.ones((size,), dtype=jnp.float32),
+        
+        # MSA相关特征
+        'msa': jnp.zeros((1, size), dtype=jnp.int32),  # 至少需要1个MSA序列
+        'msa_mask': jnp.ones((1, size), dtype=jnp.float32),
+        'msa_row_mask': jnp.ones((1,), dtype=jnp.float32),
+        'msa_chain_index': jnp.zeros((1, size), dtype=jnp.int32),
+        
+        # 序列特征
+        'seq_mask': jnp.ones((size,), dtype=jnp.float32),
+        'entity_id': jnp.zeros((size,), dtype=jnp.int32),
+        
+        # 结构相关特征
+        'atom14_atom_exists': jnp.ones((size, 14), dtype=jnp.float32),
+        'atom37_atom_exists': jnp.ones((size, 37), dtype=jnp.float32),
+        'backbone_rigid_mask': jnp.ones((size,), dtype=jnp.float32),
+        'backbone_rigid_tensor': jnp.zeros((size, 4, 4), dtype=jnp.float32),
+        
+        # 其他必要特征
+        'resolution': jnp.array([1.0], dtype=jnp.float32),
+        'num_alignments': jnp.array([1], dtype=jnp.int32),
+        'cluster_bias_mask': jnp.ones((1, size), dtype=jnp.float32),
+        'deletion_matrix': jnp.zeros((1, size), dtype=jnp.float32),
+        'deletion_mean': jnp.zeros((size,), dtype=jnp.float32),
     }
+    
+    # 添加pair特征
+    batch.update({
+        'pair_mask': jnp.ones((size, size), dtype=jnp.float32),
+        'pair_residue_distances': jnp.zeros((size, size), dtype=jnp.float32),
+        'pair_chain_distances': jnp.zeros((size, size), dtype=jnp.float32),
+    })
+    
+    return batch
 
 def parallel_featurisation(
     fold_input: folding_input.Input,
