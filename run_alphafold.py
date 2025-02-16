@@ -507,23 +507,48 @@ def batch_process_seeds(args_batch):
     try:
         # 将所有输入转换为device arrays
         def convert_to_jax(x):
-            if isinstance(x, np.ndarray):
-                return jax.device_put(x)
-            return x
+            """将输入转换为JAX可用的数组类型
             
-        # 转换examples中的所有numpy数组为jax数组
-        try:
-            from jax import tree
-            examples = [
-                tree.map(convert_to_jax, example)
+            Args:
+                x: 输入数据
+                
+            Returns:
+                转换后的数据
+            """
+            if isinstance(x, np.ndarray):
+                # 只转换数值类型的数组
+                if np.issubdtype(x.dtype, np.number):
+                    return jax.device_put(x)
+                return x
+            elif isinstance(x, (int, float)):
+                return jnp.array(x)
+            return x
+
+        def convert_batch_for_jax(examples, tree_map_fn):
+            """将批处理数据转换为JAX可用的格式
+            
+            Args:
+                examples: 输入样本列表
+                tree_map_fn: 树映射函数(tree.map 或 tree_util.tree_map)
+                
+            Returns:
+                转换后的批处理数据
+            """
+            def stack_arrays(*xs):
+                # 检查是否所有输入都是数值类型的数组
+                if all(isinstance(x, np.ndarray) and np.issubdtype(x.dtype, np.number) for x in xs):
+                    return jax.device_put(jnp.stack(xs))
+                # 如果不是数值类型，保持原样
+                return xs[0]
+            
+            # 首先转换每个样本中的数组
+            converted_examples = [
+                tree_map_fn(convert_to_jax, example)
                 for example in examples
             ]
-        except ImportError:
-            from jax import tree_util
-            examples = [
-                tree_util.tree_map(convert_to_jax, example)
-                for example in examples
-            ]
+            
+            # 然后堆叠转换后的样本
+            return tree_map_fn(stack_arrays, *converted_examples)
             
         # 创建批量随机密钥并确保在设备上
         rng_keys = jax.device_put(
@@ -531,16 +556,7 @@ def batch_process_seeds(args_batch):
         )
         
         # 堆叠并转换为device arrays
-        try:
-            batched_examples = tree.map(
-                lambda *x: jax.device_put(jnp.stack(x)),
-                *examples
-            )
-        except ImportError:
-            batched_examples = tree_util.tree_map(
-                lambda *x: jax.device_put(jnp.stack(x)),
-                *examples
-            )
+        batched_examples = convert_batch_for_jax(examples, tree_util.tree_map)
         
         # 清理GPU内存
         clear_gpu_memory()
@@ -571,16 +587,10 @@ def batch_process_seeds(args_batch):
             extract_start = time.time()
             
             # 从批处理结果中提取单个结果
-            try:
-                single_result = tree.map(
-                    lambda x: jax.device_get(x[i]),  # 确保转回host内存
-                    batch_results
-                )
-            except ImportError:
-                single_result = tree_util.tree_map(
-                    lambda x: jax.device_get(x[i]),
-                    batch_results
-                )
+            single_result = tree_util.tree_map(
+                lambda x: jax.device_get(x[i]),  # 确保转回host内存
+                batch_results
+            )
             
             inference_results, embeddings = (
                 model_runner.extract_inference_results_and_maybe_embeddings(
@@ -616,6 +626,50 @@ def batch_process_seeds(args_batch):
             
     return results
 
+def convert_to_jax(x):
+    """将输入转换为JAX可用的数组类型
+    
+    Args:
+        x: 输入数据
+        
+    Returns:
+        转换后的数据
+    """
+    if isinstance(x, np.ndarray):
+        # 只转换数值类型的数组
+        if np.issubdtype(x.dtype, np.number):
+            return jax.device_put(x)
+        return x
+    elif isinstance(x, (int, float)):
+        return jnp.array(x)
+    return x
+
+def convert_batch_for_jax(examples, tree_map_fn):
+    """将批处理数据转换为JAX可用的格式
+    
+    Args:
+        examples: 输入样本列表
+        tree_map_fn: 树映射函数(tree.map 或 tree_util.tree_map)
+        
+    Returns:
+        转换后的批处理数据
+    """
+    def stack_arrays(*xs):
+        # 检查是否所有输入都是数值类型的数组
+        if all(isinstance(x, np.ndarray) and np.issubdtype(x.dtype, np.number) for x in xs):
+            return jax.device_put(jnp.stack(xs))
+        # 如果不是数值类型，保持原样
+        return xs[0]
+    
+    # 首先转换每个样本中的数组
+    converted_examples = [
+        tree_map_fn(convert_to_jax, example)
+        for example in examples
+    ]
+    
+    # 然后堆叠转换后的样本
+    return tree_map_fn(stack_arrays, *converted_examples)
+
 def benchmark_batch_size(
     examples: list,
     model_runner: ModelRunner,
@@ -623,25 +677,12 @@ def benchmark_batch_size(
     fold_input: folding_input.Input,
     max_memory_usage_percent: float = 90.0,
 ) -> tuple[float, bool]:
-    """测试指定批大小的性能
-    
-    Args:
-        examples: 要处理的样本列表
-        model_runner: 模型运行器
-        batch_size: 要测试的批大小
-        fold_input: 输入数据
-        max_memory_usage_percent: 最大允许的显存使用百分比
-        
-    Returns:
-        tuple[float, bool]: (每个样本的处理时间, 是否成功)
-    """
+    """测试指定批大小的性能"""
     if len(examples) < batch_size:
         return float('inf'), False
         
-    # 清理GPU内存
     clear_gpu_memory()
     
-    # 检查当前内存状态
     mem_info = get_gpu_memory()
     if (mem_info['used'] / mem_info['total']) * 100 > max_memory_usage_percent:
         return float('inf'), False
@@ -651,55 +692,26 @@ def benchmark_batch_size(
         test_examples = examples[:batch_size]
         test_seeds = list(range(batch_size))
         
-        # 将所有输入转换为device arrays
-        def convert_to_jax(x):
-            if isinstance(x, np.ndarray):
-                return jax.device_put(x)
-            return x
-            
-        # 转换examples中的所有numpy数组为jax数组
+        # 创建批量随机密钥
+        rng_keys = jax.device_put(
+            jnp.stack([jax.random.PRNGKey(seed) for seed in test_seeds])
+        )
+        
+        # 转换批处理数据
         try:
             from jax import tree
-            test_examples = [
-                tree.map(convert_to_jax, example)
-                for example in test_examples
-            ]
-            
-            # 创建批量随机密钥并确保在设备上
-            rng_keys = jax.device_put(
-                jnp.stack([jax.random.PRNGKey(seed) for seed in test_seeds])
-            )
-            
-            # 堆叠并转换为device arrays
-            batched_examples = tree.map(
-                lambda *x: jax.device_put(jnp.stack(x)),
-                *test_examples
-            )
+            batched_examples = convert_batch_for_jax(test_examples, tree.map)
         except ImportError:
             from jax import tree_util
-            test_examples = [
-                tree_util.tree_map(convert_to_jax, example)
-                for example in test_examples
-            ]
-            
-            # 创建批量随机密钥并确保在设备上
-            rng_keys = jax.device_put(
-                jnp.stack([jax.random.PRNGKey(seed) for seed in test_seeds])
-            )
-            
-            # 堆叠并转换为device arrays
-            batched_examples = tree_util.tree_map(
-                lambda *x: jax.device_put(jnp.stack(x)),
-                *test_examples
-            )
+            batched_examples = convert_batch_for_jax(test_examples, tree_util.tree_map)
         
         # 使用jit包装的推理函数
         @functools.partial(
             jax.jit,
-            static_argnames=['batch_size'],  # 标记batch_size为静态参数
+            static_argnames=['batch_size'],
         )
-        def batched_inference(batched_examples, rng_keys, batch_size):
-            return model_runner.run_inference(batched_examples, rng_keys)
+        def batched_inference(examples, keys, batch_size):
+            return model_runner.run_inference(examples, keys)
         
         # 测试推理时间
         start_time = time.time()
@@ -710,10 +722,8 @@ def benchmark_batch_size(
         )
         end_time = time.time()
         
-        # 计算每个样本的平均处理时间
         time_per_sample = (end_time - start_time) / batch_size
         
-        # 检查内存使用是否超过阈值
         mem_info = get_gpu_memory()
         if (mem_info['used'] / mem_info['total']) * 100 > max_memory_usage_percent:
             return float('inf'), False
