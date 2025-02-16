@@ -19,6 +19,11 @@ if received directly from Google. Use is subject to terms of use available at
 https://github.com/google-deepmind/alphafold3/blob/main/WEIGHTS_TERMS_OF_USE.md
 """
 
+import os
+# 禁用ROCM和TPU检查
+os.environ['JAX_PLATFORMS'] = 'cpu,cuda'
+os.environ['JAX_SKIP_BACKEND_CHECK'] = '1'
+
 from collections.abc import Callable, Sequence
 import csv
 import dataclasses
@@ -551,29 +556,99 @@ def predict_structure(
     buckets: Sequence[int] | None = None,
     conformer_max_iterations: int | None = None,
 ) -> Sequence[ResultsForSeed]:
-    """优化特征提取的并行处理."""
+    """运行完整的推理管道来预测每个种子的结构."""
     print(f'Featurising data with {len(fold_input.rng_seeds)} seed(s)...')
     featurisation_start_time = time.time()
     
-    # 添加并行处理
-    with multiprocessing.Pool() as pool:
-        # 准备特征化参数
-        featurisation_args = [
-            (fold_input, buckets, conformer_max_iterations)
-            for _ in range(len(fold_input.rng_seeds))
-        ]
+    # 初始化特征缓存
+    feature_cache = FeatureCache(
+        cache_dir=os.path.join(_OUTPUT_DIR.value, '.feature_cache')
+    )
+    
+    # 检查缓存
+    cached_features = feature_cache.get_cached_features(fold_input)
+    if cached_features is not None:
+        print('Using cached features')
+        featurised_examples = [cached_features] * len(fold_input.rng_seeds)
+    else:
+        print('Generating features...')
+        # 获取CCD实例
+        ccd = chemical_components.cached_ccd(user_ccd=fold_input.user_ccd)
         
-        # 并行执行特征化
-        featurised_examples = pool.starmap(
-            featurisation.featurise_input_single,
-            featurisation_args
+        # 特征化处理
+        featurised_example = featurisation.featurise_input(
+            fold_input=fold_input,
+            buckets=buckets,
+            ccd=ccd,
+            verbose=True,
+            conformer_max_iterations=conformer_max_iterations,
         )
+        
+        # 特征优化
+        featurised_example = optimize_features(featurised_example)
+        
+        # 特征验证
+        validate_features(featurised_example)
+        
+        # 特征压缩
+        featurised_example = compress_features(featurised_example)
+        
+        # 缓存特征
+        feature_cache.cache_features(fold_input, featurised_example)
+        
+        # 为每个种子复制特征
+        featurised_examples = [featurised_example] * len(fold_input.rng_seeds)
     
     print(
         f'Featurising data with {len(fold_input.rng_seeds)} seed(s) took'
         f' {time.time() - featurisation_start_time:.2f} seconds.'
     )
-    return featurised_examples
+    
+    print(
+        'Running model inference and extracting output structure samples with'
+        f' {len(fold_input.rng_seeds)} seed(s)...'
+    )
+    all_inference_start_time = time.time()
+    all_inference_results = []
+    
+    for seed, example in zip(fold_input.rng_seeds, featurised_examples):
+        print(f'Running model inference with seed {seed}...')
+        inference_start_time = time.time()
+        rng_key = jax.random.PRNGKey(seed)
+        result = model_runner.run_inference(example, rng_key)
+        print(
+            f'Running model inference with seed {seed} took'
+            f' {time.time() - inference_start_time:.2f} seconds.'
+        )
+        
+        print(f'Extracting inference results with seed {seed}...')
+        extract_structures = time.time()
+        inference_results, embeddings = (
+            model_runner.extract_inference_results_and_maybe_embeddings(
+                batch=example, result=result, target_name=fold_input.name
+            )
+        )
+        print(
+            f'Extracting {len(inference_results)} inference samples with'
+            f' seed {seed} took {time.time() - extract_structures:.2f} seconds.'
+        )
+        
+        all_inference_results.append(
+            ResultsForSeed(
+                seed=seed,
+                inference_results=inference_results,
+                full_fold_input=fold_input,
+                embeddings=embeddings,
+            )
+        )
+        
+    print(
+        'Running model inference and extracting output structures with'
+        f' {len(fold_input.rng_seeds)} seed(s) took'
+        f' {time.time() - all_inference_start_time:.2f} seconds.'
+    )
+    
+    return all_inference_results
 
 
 def write_fold_input_json(
