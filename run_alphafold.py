@@ -840,7 +840,22 @@ def create_dummy_batch(size: int) -> features.BatchDict:
         'polymer_chain_index': jnp.zeros((size,), dtype=jnp.int32),
         'polymer_sequence_mask': jnp.ones((size,), dtype=jnp.float32),
         'polymer_residue_position': jnp.arange(size, dtype=jnp.int32),
+        
+        # 参考结构相关特征
+        'ref_pos': jnp.zeros((size, 37, 3), dtype=jnp.float32),  # 参考原子位置
+        'ref_mask': jnp.zeros((size, 37), dtype=jnp.float32),  # 参考原子掩码
+        'ref_exists': jnp.zeros((size,), dtype=jnp.bool_),  # 参考结构存在标志
+        'ref_confidence': jnp.zeros((size,), dtype=jnp.float32),  # 参考结构置信度
+        'ref_resolution': jnp.array([3.0], dtype=jnp.float32),  # 参考结构分辨率
+        'ref_release_date': jnp.array([20240101], dtype=jnp.int32),  # 参考结构发布日期
+        'ref_chain_index': jnp.zeros((size,), dtype=jnp.int32),  # 参考链索引
+        'ref_aatype': jnp.zeros((size,), dtype=jnp.int32),  # 参考氨基酸类型
+        'ref_backbone_frame_tensor': jnp.zeros((size, 4, 4), dtype=jnp.float32),  # 参考骨架坐标系
+        'ref_backbone_frame_mask': jnp.zeros((size,), dtype=jnp.float32),  # 参考骨架掩码
     }
+    
+    # 初始化参考骨架坐标系的对角线为1
+    batch['ref_backbone_frame_tensor'] = batch['ref_backbone_frame_tensor'].at[:, jnp.arange(4), jnp.arange(4)].set(1.0)
     
     # 初始化刚性变换矩阵的对角线为1
     batch['token_rigid_transform'] = batch['token_rigid_transform'].at[:, jnp.arange(4), jnp.arange(4)].set(1.0)
