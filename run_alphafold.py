@@ -856,7 +856,10 @@ def validate_features(
     
     # 从不同特征中获取序列长度
     if 'seq_length' in featurised_example:
-        seq_lengths.append(featurised_example['seq_length'])
+        seq_len = featurised_example['seq_length']
+        if isinstance(seq_len, np.ndarray):
+            seq_len = seq_len.item()  # 转换numpy标量为Python标量
+        seq_lengths.append(seq_len)
     if 'aatype' in featurised_example:
         seq_lengths.append(len(featurised_example['aatype']))
     if 'residue_index' in featurised_example:
@@ -867,8 +870,11 @@ def validate_features(
         
     # 使用最小的序列长度作为参考
     seq_length = min(seq_lengths)
-    if len(set(seq_lengths)) > 1:
-        print(f'Warning: Different sequence lengths detected: {seq_lengths}')
+    
+    # 检查序列长度是否一致
+    unique_lengths = set(int(length) for length in seq_lengths)  # 确保所有长度都是Python整数
+    if len(unique_lengths) > 1:
+        print(f'Warning: Different sequence lengths detected: {sorted(unique_lengths)}')
         print(f'Using minimum length: {seq_length}')
         
     # 验证特征维度
