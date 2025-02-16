@@ -19,14 +19,6 @@ if received directly from Google. Use is subject to terms of use available at
 https://github.com/google-deepmind/alphafold3/blob/main/WEIGHTS_TERMS_OF_USE.md
 """
 
-import os
-# GPU优化相关环境变量
-os.environ['JAX_PLATFORMS'] = 'cuda'  # 只使用CUDA
-os.environ['JAX_DISABLE_MOST_OPTIMIZATIONS'] = '0'  # 启用优化
-os.environ['XLA_PYTHON_CLIENT_ALLOCATOR'] = 'platform'  # 使用平台默认内存分配器
-os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION'] = '0.95'  # 允许使用95%的GPU内存
-os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'  # 允许GPU内存动态增长
-
 from collections.abc import Callable, Sequence
 import csv
 import dataclasses
@@ -60,9 +52,6 @@ import haiku as hk
 import jax
 from jax import numpy as jnp
 import numpy as np
-import gc
-import nvidia_smi
-import torch
 
 
 _HOME_DIR = pathlib.Path(os.environ.get('HOME'))
@@ -282,59 +271,6 @@ _SAVE_EMBEDDINGS = flags.DEFINE_bool(
     'Whether to save the final trunk single and pair embeddings in the output.',
 )
 
-# 在文件开头添加计时开始
-_start_time = time.time()
-
-
-def clear_gpu_memory():
-    """清理GPU内存的通用函数"""
-    try:
-        gc.collect()
-        torch.cuda.empty_cache()
-        jax.clear_caches()
-    except:
-        pass
-
-def get_gpu_memory():
-    """获取GPU内存使用情况
-    
-    Returns:
-        dict: 包含used(已用)、total(总量)、free(可用)的内存信息(MB)
-    """
-    try:
-        import nvidia_smi
-        nvidia_smi.nvmlInit()
-        handle = nvidia_smi.nvmlDeviceGetHandleByIndex(0)
-        info = nvidia_smi.nvmlDeviceGetMemoryInfo(handle)
-        return {
-            'used': info.used / 1024**2,    # 转换为MB
-            'total': info.total / 1024**2,   # 转换为MB
-            'free': info.free / 1024**2      # 转换为MB
-        }
-    except Exception as e:
-        print(f"Warning: Failed to get GPU memory info: {e}")
-        # 返回默认值
-        return {
-            'used': 0,
-            'total': 16*1024,  # 假设16GB总内存
-            'free': 16*1024
-        }
-
-def check_gpu_memory(threshold_mb=2000):  # 提高阈值到2GB
-    """检查是否有足够的GPU内存
-    
-    Args:
-        threshold_mb: 最小所需的可用内存(MB)，默认2GB
-        
-    Returns:
-        bool: 是否有足够的可用内存
-    """
-    mem_info = get_gpu_memory()
-    if mem_info['free'] < threshold_mb:
-        print(f"Warning: Low GPU memory - only {mem_info['free']:.0f}MB free")
-        return False
-    return True
-
 
 def make_model_config(
     *,
@@ -449,27 +385,43 @@ class ResultsForSeed:
   embeddings: dict[str, np.ndarray] | None = None
 
 
-def process_single_seed(args):
-    """处理单个种子的推理任务
-    
-    Args:
-        args: tuple containing (seed, example, model_runner, fold_input)
-        
-    Returns:
-        ResultsForSeed object containing inference results
-    """
-    seed, example, model_runner, fold_input = args
+def predict_structure(
+    fold_input: folding_input.Input,
+    model_runner: ModelRunner,
+    buckets: Sequence[int] | None = None,
+    conformer_max_iterations: int | None = None,
+) -> Sequence[ResultsForSeed]:
+  """Runs the full inference pipeline to predict structures for each seed."""
+
+  print(f'Featurising data with {len(fold_input.rng_seeds)} seed(s)...')
+  featurisation_start_time = time.time()
+  ccd = chemical_components.cached_ccd(user_ccd=fold_input.user_ccd)
+  featurised_examples = featurisation.featurise_input(
+      fold_input=fold_input,
+      buckets=buckets,
+      ccd=ccd,
+      verbose=True,
+      conformer_max_iterations=conformer_max_iterations,
+  )
+  print(
+      f'Featurising data with {len(fold_input.rng_seeds)} seed(s) took'
+      f' {time.time() - featurisation_start_time:.2f} seconds.'
+  )
+  print(
+      'Running model inference and extracting output structure samples with'
+      f' {len(fold_input.rng_seeds)} seed(s)...'
+  )
+  all_inference_start_time = time.time()
+  all_inference_results = []
+  for seed, example in zip(fold_input.rng_seeds, featurised_examples):
     print(f'Running model inference with seed {seed}...')
     inference_start_time = time.time()
-    
     rng_key = jax.random.PRNGKey(seed)
     result = model_runner.run_inference(example, rng_key)
-    
     print(
         f'Running model inference with seed {seed} took'
         f' {time.time() - inference_start_time:.2f} seconds.'
     )
-    
     print(f'Extracting inference results with seed {seed}...')
     extract_structures = time.time()
     inference_results, embeddings = (
@@ -481,65 +433,21 @@ def process_single_seed(args):
         f'Extracting {len(inference_results)} inference samples with'
         f' seed {seed} took {time.time() - extract_structures:.2f} seconds.'
     )
-    
-    return ResultsForSeed(
-        seed=seed,
-        inference_results=inference_results,
-        full_fold_input=fold_input,
-        embeddings=embeddings,
-    )
 
-def predict_structure(
-    fold_input: folding_input.Input,
-    model_runner: ModelRunner,
-    buckets: Sequence[int] | None = None,
-    conformer_max_iterations: int | None = None,
-) -> Sequence[ResultsForSeed]:
-    """预测结构的主函数"""
-    
-    print(f'Featurising data with {len(fold_input.rng_seeds)} seed(s)...')
-    featurisation_start_time = time.time()
-    ccd = chemical_components.cached_ccd(user_ccd=fold_input.user_ccd)
-    featurised_examples = featurisation.featurise_input(
-        fold_input=fold_input,
-        buckets=buckets,
-        ccd=ccd,
-        verbose=True,
-        conformer_max_iterations=conformer_max_iterations,
+    all_inference_results.append(
+        ResultsForSeed(
+            seed=seed,
+            inference_results=inference_results,
+            full_fold_input=fold_input,
+            embeddings=embeddings,
+        )
     )
-    print(
-        f'Featurising data with {len(fold_input.rng_seeds)} seed(s) took'
-        f' {time.time() - featurisation_start_time:.2f} seconds.'
-    )
-    
-    print(
-        'Running inference and extracting output structure samples with'
-        f' {len(fold_input.rng_seeds)} seed(s)...'
-    )
-    all_inference_start_time = time.time()
-    
-    # 准备单样本处理参数
-    process_args = [
-        (seed, example, model_runner, fold_input)
-        for seed, example in zip(fold_input.rng_seeds, featurised_examples)
-    ]
-    
-    # 逐个处理每个样本
-    all_results = []
-    for args in process_args:
-        # 清理GPU内存
-        clear_gpu_memory()
-        # 处理单个样本
-        result = process_single_seed(args)
-        all_results.append(result)
-    
-    print(
-        'Running inference and extracting output structures with'
-        f' {len(fold_input.rng_seeds)} seed(s) took'
-        f' {time.time() - all_inference_start_time:.2f} seconds.'
-    )
-    
-    return all_results
+  print(
+      'Running model inference and extracting output structures with'
+      f' {len(fold_input.rng_seeds)} seed(s) took'
+      f' {time.time() - all_inference_start_time:.2f} seconds.'
+  )
+  return all_inference_results
 
 
 def write_fold_input_json(
@@ -871,10 +779,6 @@ def main(_):
     num_fold_inputs += 1
 
   print(f'Done running {num_fold_inputs} fold jobs.')
-
-  # 在程序结束时输出总运行时间
-  total_time = time.time() - _start_time
-  print(f'总运行时间: {total_time:.2f} 秒')
 
 
 if __name__ == '__main__':
