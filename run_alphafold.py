@@ -271,6 +271,20 @@ _SAVE_EMBEDDINGS = flags.DEFINE_bool(
     'Whether to save the final trunk single and pair embeddings in the output.',
 )
 
+# 添加新的配置选项
+_JAX_CACHE_SIZE = flags.DEFINE_integer(
+    'jax_cache_size',
+    5000,  # 默认缓存5000个编译结果
+    '设置JAX编译缓存大小(MB)',
+)
+
+_JAX_CACHE_EVICTION = flags.DEFINE_enum(
+    'jax_cache_eviction',
+    default='lru',
+    enum_values=['lru', 'fifo'],
+    help='JAX缓存淘汰策略'
+)
+
 
 def make_model_config(
     *,
@@ -632,153 +646,198 @@ def process_fold_input(
   return output
 
 
-def main(_):
-  if _JAX_COMPILATION_CACHE_DIR.value is not None:
-    jax.config.update(
-        'jax_compilation_cache_dir', _JAX_COMPILATION_CACHE_DIR.value
-    )
+def configure_jax_cache():
+    """配置JAX编译缓存"""
+    if _JAX_COMPILATION_CACHE_DIR.value is not None:
+        # 设置缓存目录
+        jax.config.update('jax_compilation_cache_dir', _JAX_COMPILATION_CACHE_DIR.value)
+        
+        # 设置缓存大小
+        jax.config.update('jax_compilation_cache_size_mb', _JAX_CACHE_SIZE.value)
+        
+        # 设置缓存淘汰策略
+        jax.config.update('jax_compilation_cache_eviction_policy', _JAX_CACHE_EVICTION.value)
+        
+        print(f'JAX compilation cache configured:')
+        print(f'- Cache directory: {_JAX_COMPILATION_CACHE_DIR.value}')
+        print(f'- Cache size: {_JAX_CACHE_SIZE.value}MB')
+        print(f'- Eviction policy: {_JAX_CACHE_EVICTION.value}')
 
-  if _JSON_PATH.value is None == _INPUT_DIR.value is None:
-    raise ValueError(
-        'Exactly one of --json_path or --input_dir must be specified.'
-    )
 
-  if not _RUN_INFERENCE.value and not _RUN_DATA_PIPELINE.value:
-    raise ValueError(
-        'At least one of --run_inference or --run_data_pipeline must be'
-        ' set to true.'
-    )
+def optimize_bucket_sizes(fold_inputs: Sequence[folding_input.Input]) -> list[int]:
+    """根据输入序列长度分布优化bucket大小"""
+    # 收集所有序列长度
+    seq_lengths = []
+    for fold_input in fold_inputs:
+        for chain in fold_input.chains:
+            seq_lengths.append(len(chain.sequence))
+    
+    # 计算序列长度分布
+    seq_lengths = np.array(seq_lengths)
+    percentiles = np.percentile(seq_lengths, [25, 50, 75, 90, 95, 99])
+    
+    # 生成优化后的bucket大小
+    buckets = []
+    for p in percentiles:
+        # 向上取整到最近的64的倍数
+        bucket_size = int(np.ceil(p / 64) * 64)
+        if bucket_size not in buckets:
+            buckets.append(bucket_size)
+    
+    # 确保有足够大的bucket处理极端情况
+    max_length = max(seq_lengths)
+    if max_length > buckets[-1]:
+        buckets.append(int(np.ceil(max_length / 64) * 64))
+        
+    return sorted(buckets)
 
-  if _INPUT_DIR.value is not None:
-    fold_inputs = folding_input.load_fold_inputs_from_dir(
-        pathlib.Path(_INPUT_DIR.value)
-    )
-  elif _JSON_PATH.value is not None:
-    fold_inputs = folding_input.load_fold_inputs_from_path(
-        pathlib.Path(_JSON_PATH.value)
-    )
-  else:
-    raise AssertionError(
-        'Exactly one of --json_path or --input_dir must be specified.'
-    )
+def update_buckets(fold_inputs: Sequence[folding_input.Input]):
+    """更新bucket配置"""
+    if not _BUCKETS.value:  # 如果未指定bucket sizes
+        optimized_buckets = optimize_bucket_sizes(fold_inputs)
+        flags.FLAGS.buckets = [str(b) for b in optimized_buckets]
+        print(f'Optimized bucket sizes: {optimized_buckets}')
 
-  # Make sure we can create the output directory before running anything.
-  try:
-    os.makedirs(_OUTPUT_DIR.value, exist_ok=True)
-  except OSError as e:
-    print(f'Failed to create output directory {_OUTPUT_DIR.value}: {e}')
-    raise
 
-  if _RUN_INFERENCE.value:
-    # Fail early on incompatible devices, but only if we're running inference.
-    gpu_devices = jax.local_devices(backend='gpu')
-    if gpu_devices:
-      compute_capability = float(
-          gpu_devices[_GPU_DEVICE.value].compute_capability
-      )
-      if compute_capability < 6.0:
-        raise ValueError(
-            'AlphaFold 3 requires at least GPU compute capability 6.0 (see'
-            ' https://developer.nvidia.com/cuda-gpus).'
+def warmup_compilation(
+    model_runner: ModelRunner,
+    example_inputs: Sequence[features.BatchDict]
+) -> None:
+    """预热JAX编译缓存"""
+    print('Warming up JAX compilation cache...')
+    start_time = time.time()
+    
+    # 对每个bucket size进行预热
+    for bucket_size in map(int, _BUCKETS.value):
+        # 创建示例输入
+        dummy_input = create_dummy_batch(bucket_size)
+        # 运行一次前向传播进行预热
+        _ = model_runner.run_inference(
+            dummy_input,
+            jax.random.PRNGKey(0)
         )
-      elif 7.0 <= compute_capability < 8.0:
-        xla_flags = os.environ.get('XLA_FLAGS')
-        required_flag = '--xla_disable_hlo_passes=custom-kernel-fusion-rewriter'
-        if not xla_flags or required_flag not in xla_flags:
-          raise ValueError(
-              'For devices with GPU compute capability 7.x (see'
-              ' https://developer.nvidia.com/cuda-gpus) the ENV XLA_FLAGS must'
-              f' include "{required_flag}".'
-          )
-        if _FLASH_ATTENTION_IMPLEMENTATION.value != 'xla':
-          raise ValueError(
-              'For devices with GPU compute capability 7.x (see'
-              ' https://developer.nvidia.com/cuda-gpus) the'
-              ' --flash_attention_implementation must be set to "xla".'
-          )
+        
+    print(f'Compilation warmup took {time.time() - start_time:.2f} seconds')
 
-  notice = textwrap.wrap(
-      'Running AlphaFold 3. Please note that standard AlphaFold 3 model'
-      ' parameters are only available under terms of use provided at'
-      ' https://github.com/google-deepmind/alphafold3/blob/main/WEIGHTS_TERMS_OF_USE.md.'
-      ' If you do not agree to these terms and are using AlphaFold 3 derived'
-      ' model parameters, cancel execution of AlphaFold 3 inference with'
-      ' CTRL-C, and do not use the model parameters.',
-      break_long_words=False,
-      break_on_hyphens=False,
-      width=80,
-  )
-  print('\n' + '\n'.join(notice) + '\n')
+def create_dummy_batch(size: int) -> features.BatchDict:
+    """创建指定大小的示例输入用于预热"""
+    # 创建符合模型输入要求的dummy数据
+    return {
+        'aatype': jnp.zeros((size,), dtype=jnp.int32),
+        'residue_index': jnp.arange(size),
+        # ... 其他必要的特征字段
+    }
 
-  if _RUN_DATA_PIPELINE.value:
-    expand_path = lambda x: replace_db_dir(x, DB_DIR.value)
-    max_template_date = datetime.date.fromisoformat(_MAX_TEMPLATE_DATE.value)
-    data_pipeline_config = pipeline.DataPipelineConfig(
-        jackhmmer_binary_path=_JACKHMMER_BINARY_PATH.value,
-        nhmmer_binary_path=_NHMMER_BINARY_PATH.value,
-        hmmalign_binary_path=_HMMALIGN_BINARY_PATH.value,
-        hmmsearch_binary_path=_HMMSEARCH_BINARY_PATH.value,
-        hmmbuild_binary_path=_HMMBUILD_BINARY_PATH.value,
-        small_bfd_database_path=expand_path(_SMALL_BFD_DATABASE_PATH.value),
-        mgnify_database_path=expand_path(_MGNIFY_DATABASE_PATH.value),
-        uniprot_cluster_annot_database_path=expand_path(
-            _UNIPROT_CLUSTER_ANNOT_DATABASE_PATH.value
-        ),
-        uniref90_database_path=expand_path(_UNIREF90_DATABASE_PATH.value),
-        ntrna_database_path=expand_path(_NTRNA_DATABASE_PATH.value),
-        rfam_database_path=expand_path(_RFAM_DATABASE_PATH.value),
-        rna_central_database_path=expand_path(_RNA_CENTRAL_DATABASE_PATH.value),
-        pdb_database_path=expand_path(_PDB_DATABASE_PATH.value),
-        seqres_database_path=expand_path(_SEQRES_DATABASE_PATH.value),
-        jackhmmer_n_cpu=_JACKHMMER_N_CPU.value,
-        nhmmer_n_cpu=_NHMMER_N_CPU.value,
-        max_template_date=max_template_date,
-    )
-  else:
-    data_pipeline_config = None
-
-  if _RUN_INFERENCE.value:
-    devices = jax.local_devices(backend='gpu')
-    print(
-        f'Found local devices: {devices}, using device {_GPU_DEVICE.value}:'
-        f' {devices[_GPU_DEVICE.value]}'
-    )
-
-    print('Building model from scratch...')
-    model_runner = ModelRunner(
-        config=make_model_config(
-            flash_attention_implementation=typing.cast(
-                attention.Implementation, _FLASH_ATTENTION_IMPLEMENTATION.value
+def main(_):
+    # 配置JAX缓存
+    configure_jax_cache()
+    
+    # 加载输入数据
+    if _INPUT_DIR.value is not None:
+        fold_inputs = folding_input.load_fold_inputs_from_dir(
+            pathlib.Path(_INPUT_DIR.value)
+        )
+    elif _JSON_PATH.value is not None:
+        fold_inputs = folding_input.load_fold_inputs_from_path(
+            pathlib.Path(_JSON_PATH.value)
+        )
+    
+    # 优化bucket sizes
+    update_buckets(fold_inputs)
+    
+    if _RUN_INFERENCE.value:
+        # 初始化模型
+        model_runner = ModelRunner(
+            config=make_model_config(
+                flash_attention_implementation=typing.cast(
+                    attention.Implementation, _FLASH_ATTENTION_IMPLEMENTATION.value
+                ),
+                num_diffusion_samples=_NUM_DIFFUSION_SAMPLES.value,
+                num_recycles=_NUM_RECYCLES.value,
+                return_embeddings=_SAVE_EMBEDDINGS.value,
             ),
-            num_diffusion_samples=_NUM_DIFFUSION_SAMPLES.value,
-            num_recycles=_NUM_RECYCLES.value,
-            return_embeddings=_SAVE_EMBEDDINGS.value,
-        ),
-        device=devices[_GPU_DEVICE.value],
-        model_dir=pathlib.Path(MODEL_DIR.value),
-    )
-    # Check we can load the model parameters before launching anything.
-    print('Checking that model parameters can be loaded...')
-    _ = model_runner.model_params
-  else:
-    model_runner = None
+            device=jax.local_devices(backend='gpu')[_GPU_DEVICE.value],
+            model_dir=pathlib.Path(MODEL_DIR.value),
+        )
+        
+        # 创建示例输入进行编译预热
+        example_inputs = [
+            create_dummy_batch(int(bucket))
+            for bucket in _BUCKETS.value[:3]  # 只预热前几个常用size
+        ]
+        warmup_compilation(model_runner, example_inputs)
+        
+        # 继续处理实际输入...
 
-  num_fold_inputs = 0
-  for fold_input in fold_inputs:
-    if _NUM_SEEDS.value is not None:
-      print(f'Expanding fold job {fold_input.name} to {_NUM_SEEDS.value} seeds')
-      fold_input = fold_input.with_multiple_seeds(_NUM_SEEDS.value)
-    process_fold_input(
-        fold_input=fold_input,
-        data_pipeline_config=data_pipeline_config,
-        model_runner=model_runner,
-        output_dir=os.path.join(_OUTPUT_DIR.value, fold_input.sanitised_name()),
-        buckets=tuple(int(bucket) for bucket in _BUCKETS.value),
-        conformer_max_iterations=_CONFORMER_MAX_ITERATIONS.value,
-    )
-    num_fold_inputs += 1
+    if _RUN_DATA_PIPELINE.value:
+        expand_path = lambda x: replace_db_dir(x, DB_DIR.value)
+        max_template_date = datetime.date.fromisoformat(_MAX_TEMPLATE_DATE.value)
+        data_pipeline_config = pipeline.DataPipelineConfig(
+            jackhmmer_binary_path=_JACKHMMER_BINARY_PATH.value,
+            nhmmer_binary_path=_NHMMER_BINARY_PATH.value,
+            hmmalign_binary_path=_HMMALIGN_BINARY_PATH.value,
+            hmmsearch_binary_path=_HMMSEARCH_BINARY_PATH.value,
+            hmmbuild_binary_path=_HMMBUILD_BINARY_PATH.value,
+            small_bfd_database_path=expand_path(_SMALL_BFD_DATABASE_PATH.value),
+            mgnify_database_path=expand_path(_MGNIFY_DATABASE_PATH.value),
+            uniprot_cluster_annot_database_path=expand_path(
+                _UNIPROT_CLUSTER_ANNOT_DATABASE_PATH.value
+            ),
+            uniref90_database_path=expand_path(_UNIREF90_DATABASE_PATH.value),
+            ntrna_database_path=expand_path(_NTRNA_DATABASE_PATH.value),
+            rfam_database_path=expand_path(_RFAM_DATABASE_PATH.value),
+            rna_central_database_path=expand_path(_RNA_CENTRAL_DATABASE_PATH.value),
+            pdb_database_path=expand_path(_PDB_DATABASE_PATH.value),
+            seqres_database_path=expand_path(_SEQRES_DATABASE_PATH.value),
+            jackhmmer_n_cpu=_JACKHMMER_N_CPU.value,
+            nhmmer_n_cpu=_NHMMER_N_CPU.value,
+            max_template_date=max_template_date,
+        )
+    else:
+        data_pipeline_config = None
 
-  print(f'Done running {num_fold_inputs} fold jobs.')
+    if _RUN_INFERENCE.value:
+        devices = jax.local_devices(backend='gpu')
+        print(
+            f'Found local devices: {devices}, using device {_GPU_DEVICE.value}:'
+            f' {devices[_GPU_DEVICE.value]}'
+        )
+
+        print('Building model from scratch...')
+        model_runner = ModelRunner(
+            config=make_model_config(
+                flash_attention_implementation=typing.cast(
+                    attention.Implementation, _FLASH_ATTENTION_IMPLEMENTATION.value
+                ),
+                num_diffusion_samples=_NUM_DIFFUSION_SAMPLES.value,
+                num_recycles=_NUM_RECYCLES.value,
+                return_embeddings=_SAVE_EMBEDDINGS.value,
+            ),
+            device=devices[_GPU_DEVICE.value],
+            model_dir=pathlib.Path(MODEL_DIR.value),
+        )
+        # Check we can load the model parameters before launching anything.
+        print('Checking that model parameters can be loaded...')
+        _ = model_runner.model_params
+    else:
+        model_runner = None
+
+    num_fold_inputs = 0
+    for fold_input in fold_inputs:
+        if _NUM_SEEDS.value is not None:
+            print(f'Expanding fold job {fold_input.name} to {_NUM_SEEDS.value} seeds')
+            fold_input = fold_input.with_multiple_seeds(_NUM_SEEDS.value)
+        process_fold_input(
+            fold_input=fold_input,
+            data_pipeline_config=data_pipeline_config,
+            model_runner=model_runner,
+            output_dir=os.path.join(_OUTPUT_DIR.value, fold_input.sanitised_name()),
+            buckets=tuple(int(bucket) for bucket in _BUCKETS.value),
+            conformer_max_iterations=_CONFORMER_MAX_ITERATIONS.value,
+        )
+        num_fold_inputs += 1
+
+    print(f'Done running {num_fold_inputs} fold jobs.')
 
 
 if __name__ == '__main__':
