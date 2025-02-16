@@ -393,30 +393,30 @@ class ModelRunner:
             )
             
         # 转移数据到设备
-        with jax.profiler.TraceContext("device_transfer"):
-            featurised_example = jax.device_put(
-                jax.tree_util.tree_map(
-                    jnp.asarray,
-                    utils.remove_invalidly_typed_feats(featurised_example)
-                ),
-                self._device,
-            )
+        print('Transferring data to device...')
+        featurised_example = jax.device_put(
+            jax.tree_util.tree_map(
+                jnp.asarray,
+                utils.remove_invalidly_typed_feats(featurised_example)
+            ),
+            self._device,
+        )
 
         # 执行推理
-        with jax.profiler.TraceContext("model_inference"):
-            result = self._model(rng_key, featurised_example)
+        print('Running model inference...')
+        result = self._model(rng_key, featurised_example)
         
         # 移除padding并转换结果
         if bucket_size > num_tokens:
             print(f'Removing padding from results')
             result = self._remove_padding(result, num_tokens)
         
-        with jax.profiler.TraceContext("post_processing"):
-            result = jax.tree.map(np.asarray, result)
-            result = jax.tree.map(
-                lambda x: x.astype(jnp.float32) if x.dtype == jnp.bfloat16 else x,
-                result,
-            )
+        print('Post-processing results...')
+        result = jax.tree.map(np.asarray, result)
+        result = jax.tree.map(
+            lambda x: x.astype(jnp.float32) if x.dtype == jnp.bfloat16 else x,
+            result,
+        )
         
         # 添加模型标识
         result = dict(result)
