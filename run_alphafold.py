@@ -489,323 +489,13 @@ def process_single_seed(args):
         embeddings=embeddings,
     )
 
-def batch_process_seeds(args_batch):
-    """批量处理多个种子的推理任务"""
-    results = []
-    batch_size = len(args_batch)
-    
-    # 准备批处理数据
-    seeds = [args[0] for args in args_batch]
-    examples = [args[1] for args in args_batch]
-    model_runner = args_batch[0][2]
-    fold_input = args_batch[0][3]
-    
-    print(f'Running batch inference with seeds {seeds}...')
-    inference_start_time = time.time()
-    
-    # 确保使用jax数组
-    try:
-        # 将所有输入转换为device arrays
-        def convert_to_jax(x):
-            """将输入转换为JAX可用的数组类型
-            
-            Args:
-                x: 输入数据
-                
-            Returns:
-                转换后的数据
-            """
-            if isinstance(x, np.ndarray):
-                # 只转换数值类型的数组
-                if np.issubdtype(x.dtype, np.number):
-                    return jax.device_put(x)
-                return x
-            elif isinstance(x, (int, float)):
-                return jnp.array(x)
-            return x
-
-        def convert_batch_for_jax(examples, tree_map_fn):
-            """将批处理数据转换为JAX可用的格式
-            
-            Args:
-                examples: 输入样本列表
-                tree_map_fn: 树映射函数(tree.map 或 tree_util.tree_map)
-                
-            Returns:
-                转换后的批处理数据
-            """
-            def stack_arrays(*xs):
-                # 检查是否所有输入都是数值类型的数组
-                if all(isinstance(x, np.ndarray) and np.issubdtype(x.dtype, np.number) for x in xs):
-                    return jax.device_put(jnp.stack(xs))
-                # 如果不是数值类型，保持原样
-                return xs[0]
-            
-            # 首先转换每个样本中的数组
-            converted_examples = [
-                tree_map_fn(convert_to_jax, example)
-                for example in examples
-            ]
-            
-            # 然后堆叠转换后的样本
-            return tree_map_fn(stack_arrays, *converted_examples)
-            
-        # 创建批量随机密钥并确保在设备上
-        rng_keys = jax.device_put(
-            jnp.stack([jax.random.PRNGKey(seed) for seed in seeds])
-        )
-        
-        # 堆叠并转换为device arrays
-        batched_examples = convert_batch_for_jax(examples, tree_util.tree_map)
-        
-        # 清理GPU内存
-        clear_gpu_memory()
-            
-        # 使用jit包装的推理函数
-        @functools.partial(
-            jax.jit,
-            static_argnames=['batch_size'],  # 标记batch_size为静态参数
-        )
-        def batched_inference(batched_examples, rng_keys, batch_size):
-            return model_runner.run_inference(batched_examples, rng_keys)
-            
-        # 运行批量推理
-        batch_results = batched_inference(
-            batched_examples,
-            rng_keys,
-            batch_size=batch_size
-        )
-        
-        print(
-            f'Batch inference with {batch_size} seeds took'
-            f' {time.time() - inference_start_time:.2f} seconds.'
-        )
-        
-        # 解包批处理结果
-        for i, (seed, example) in enumerate(zip(seeds, examples)):
-            print(f'Extracting inference results for seed {seed}...')
-            extract_start = time.time()
-            
-            # 从批处理结果中提取单个结果
-            single_result = tree_util.tree_map(
-                lambda x: jax.device_get(x[i]),  # 确保转回host内存
-                batch_results
-            )
-            
-            inference_results, embeddings = (
-                model_runner.extract_inference_results_and_maybe_embeddings(
-                    batch=example,
-                    result=single_result,
-                    target_name=fold_input.name
-                )
-            )
-            
-            print(
-                f'Extracting {len(inference_results)} inference samples for seed {seed}'
-                f' took {time.time() - extract_start:.2f} seconds.'
-            )
-            
-            results.append(
-                ResultsForSeed(
-                    seed=seed,
-                    inference_results=inference_results,
-                    full_fold_input=fold_input,
-                    embeddings=embeddings,
-                )
-            )
-            
-            # 每处理完一个结果就清理一次内存
-            clear_gpu_memory()
-            
-    except Exception as e:
-        print(f'Error in batch processing: {e}')
-        print('Falling back to single sample processing...')
-        # 如果批处理失败，回退到逐个处理
-        for args in args_batch:
-            results.append(process_single_seed(args))
-            
-    return results
-
-def convert_to_jax(x):
-    """将输入转换为JAX可用的数组类型
-    
-    Args:
-        x: 输入数据
-        
-    Returns:
-        转换后的数据
-    """
-    if isinstance(x, np.ndarray):
-        # 只转换数值类型的数组
-        if np.issubdtype(x.dtype, np.number):
-            return jax.device_put(x)
-        return x
-    elif isinstance(x, (int, float)):
-        return jnp.array(x)
-    return x
-
-def convert_batch_for_jax(examples, tree_map_fn):
-    """将批处理数据转换为JAX可用的格式
-    
-    Args:
-        examples: 输入样本列表
-        tree_map_fn: 树映射函数(tree.map 或 tree_util.tree_map)
-        
-    Returns:
-        转换后的批处理数据
-    """
-    def stack_arrays(*xs):
-        # 检查是否所有输入都是数值类型的数组
-        if all(isinstance(x, np.ndarray) and np.issubdtype(x.dtype, np.number) for x in xs):
-            return jax.device_put(jnp.stack(xs))
-        # 如果不是数值类型，保持原样
-        return xs[0]
-    
-    # 首先转换每个样本中的数组
-    converted_examples = [
-        tree_map_fn(convert_to_jax, example)
-        for example in examples
-    ]
-    
-    # 然后堆叠转换后的样本
-    return tree_map_fn(stack_arrays, *converted_examples)
-
-def benchmark_batch_size(
-    examples: list,
-    model_runner: ModelRunner,
-    batch_size: int,
-    fold_input: folding_input.Input,
-    max_memory_usage_percent: float = 90.0,
-) -> tuple[float, bool]:
-    """测试指定批大小的性能"""
-    if len(examples) < batch_size:
-        return float('inf'), False
-        
-    clear_gpu_memory()
-    
-    mem_info = get_gpu_memory()
-    if (mem_info['used'] / mem_info['total']) * 100 > max_memory_usage_percent:
-        return float('inf'), False
-    
-    try:
-        # 准备测试批次
-        test_examples = examples[:batch_size]
-        test_seeds = list(range(batch_size))
-        
-        # 创建批量随机密钥
-        rng_keys = jax.device_put(
-            jnp.stack([jax.random.PRNGKey(seed) for seed in test_seeds])
-        )
-        
-        # 转换批处理数据
-        try:
-            from jax import tree
-            batched_examples = convert_batch_for_jax(test_examples, tree.map)
-        except ImportError:
-            from jax import tree_util
-            batched_examples = convert_batch_for_jax(test_examples, tree_util.tree_map)
-        
-        # 使用jit包装的推理函数
-        @functools.partial(
-            jax.jit,
-            static_argnames=['batch_size'],
-        )
-        def batched_inference(examples, keys, batch_size):
-            return model_runner.run_inference(examples, keys)
-        
-        # 测试推理时间
-        start_time = time.time()
-        batched_inference(
-            batched_examples,
-            rng_keys,
-            batch_size=batch_size
-        )
-        end_time = time.time()
-        
-        time_per_sample = (end_time - start_time) / batch_size
-        
-        mem_info = get_gpu_memory()
-        if (mem_info['used'] / mem_info['total']) * 100 > max_memory_usage_percent:
-            return float('inf'), False
-            
-        return time_per_sample, True
-        
-    except Exception as e:
-        print(f"Error testing batch size {batch_size}: {e}")
-        return float('inf'), False
-
-def find_optimal_batch_size(
-    examples: list,
-    model_runner: ModelRunner,
-    fold_input: folding_input.Input,
-    max_batch_size: int = 8,
-    min_batch_size: int = 1,
-) -> int:
-    """找到最优的批处理大小
-    
-    为3090 24GB显卡优化的版本
-    """
-    print("Finding optimal batch size...")
-    
-    # 获取序列长度
-    seq_length = len(fold_input.chains[0].sequence)
-    
-    # 根据序列长度和显存大小调整最大批大小
-    if seq_length > 1000:
-        max_batch_size = min(3, max_batch_size)  # 长序列最多3个批次
-    elif seq_length > 500:
-        max_batch_size = min(5, max_batch_size)  # 中等序列最多5个批次
-    else:
-        max_batch_size = min(8, max_batch_size)  # 短序列最多8个批次
-        
-    # 获取可用显存
-    mem_info = get_gpu_memory()
-    total_mem_gb = mem_info['total'] / 1024  # 转换为GB
-    
-    # 根据总显存调整最大批大小
-    if total_mem_gb >= 20:  # 24GB显卡
-        max_batch_size = min(max_batch_size, int(total_mem_gb / 3))  # 每个样本预估使用3GB显存
-    
-    best_batch_size = min_batch_size
-    best_time_per_sample = float('inf')
-    
-    # 测试不同的批大小
-    for batch_size in range(min_batch_size, max_batch_size + 1):
-        print(f"Testing batch size {batch_size}...")
-        
-        time_per_sample, success = benchmark_batch_size(
-            examples=examples,
-            model_runner=model_runner,
-            batch_size=batch_size,
-            fold_input=fold_input,
-            max_memory_usage_percent=90.0,  # 允许使用更多显存
-        )
-        
-        if not success:
-            print(f"Batch size {batch_size} failed, stopping search")
-            break
-            
-        print(f"Batch size {batch_size}: {time_per_sample:.2f} seconds per sample")
-        
-        # 如果这个批大小的性能更好，更新最优值
-        if time_per_sample < best_time_per_sample:
-            best_time_per_sample = time_per_sample
-            best_batch_size = batch_size
-        else:
-            # 如果性能开始下降，停止搜索
-            print("Performance decreased, stopping search")
-            break
-    
-    print(f"Selected optimal batch size: {best_batch_size}")
-    return best_batch_size
-
 def predict_structure(
     fold_input: folding_input.Input,
     model_runner: ModelRunner,
     buckets: Sequence[int] | None = None,
     conformer_max_iterations: int | None = None,
 ) -> Sequence[ResultsForSeed]:
-    """使用自适应批处理大小的推理流水线来预测结构"""
+    """预测结构的主函数"""
     
     print(f'Featurising data with {len(fold_input.rng_seeds)} seed(s)...')
     featurisation_start_time = time.time()
@@ -822,49 +512,29 @@ def predict_structure(
         f' {time.time() - featurisation_start_time:.2f} seconds.'
     )
     
-    # 找到最优批大小
-    batch_size = find_optimal_batch_size(
-        examples=featurised_examples,
-        model_runner=model_runner,
-        fold_input=fold_input,
-    )
-    
     print(
-        'Running batch inference and extracting output structure samples with'
+        'Running inference and extracting output structure samples with'
         f' {len(fold_input.rng_seeds)} seed(s)...'
     )
     all_inference_start_time = time.time()
     
-    # 准备批处理参数
+    # 准备单样本处理参数
     process_args = [
         (seed, example, model_runner, fold_input)
         for seed, example in zip(fold_input.rng_seeds, featurised_examples)
     ]
     
-    # 将参数分成批次
-    batches = [
-        process_args[i:i + batch_size]
-        for i in range(0, len(process_args), batch_size)
-    ]
-    
-    # 使用线程池处理批次
-    from concurrent.futures import ThreadPoolExecutor
-    num_threads = min(2, len(batches))
-    
-    print(f'Using {num_threads} threads for batch processing')
-    
+    # 逐个处理每个样本
     all_results = []
-    with ThreadPoolExecutor(max_workers=num_threads) as executor:
-        try:
-            batch_results = list(executor.map(batch_process_seeds, batches))
-            all_results = [result for batch in batch_results for result in batch]
-        except Exception as e:
-            print(f'Batch processing failed: {e}')
-            print('Falling back to single sample processing...')
-            all_results = [process_single_seed(args) for args in process_args]
+    for args in process_args:
+        # 清理GPU内存
+        clear_gpu_memory()
+        # 处理单个样本
+        result = process_single_seed(args)
+        all_results.append(result)
     
     print(
-        'Running batch inference and extracting output structures with'
+        'Running inference and extracting output structures with'
         f' {len(fold_input.rng_seeds)} seed(s) took'
         f' {time.time() - all_inference_start_time:.2f} seconds.'
     )
