@@ -825,9 +825,13 @@ def create_dummy_batch(size: int) -> features.BatchDict:
         # 分子类型相关特征
         'is_protein': jnp.ones((size,), dtype=jnp.bool_),  # 是否为蛋白质
         'is_rna': jnp.zeros((size,), dtype=jnp.bool_),  # 是否为RNA
+        'is_dna': jnp.zeros((size,), dtype=jnp.bool_),  # 是否为DNA
         'is_ligand': jnp.zeros((size,), dtype=jnp.bool_),  # 是否为配体
+        'is_water': jnp.zeros((size,), dtype=jnp.bool_),  # 是否为水分子
+        'is_het': jnp.zeros((size,), dtype=jnp.bool_),  # 是否为其他杂原子
         'molecule_type': jnp.zeros((size,), dtype=jnp.int32),  # 分子类型编号
         'molecule_name': jnp.zeros((size,), dtype=jnp.int32),  # 分子名称编号
+        'residue_type': jnp.zeros((size,), dtype=jnp.int32),  # 残基类型编号
     }
     
     # 初始化刚性变换矩阵的对角线为1
