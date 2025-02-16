@@ -744,6 +744,9 @@ def create_dummy_batch(size: int) -> features.BatchDict:
         'msa_mask': jnp.ones((1, size), dtype=jnp.float32),
         'msa_row_mask': jnp.ones((1,), dtype=jnp.float32),
         'msa_chain_index': jnp.zeros((1, size), dtype=jnp.int32),
+        'profile': jnp.zeros((size, 21), dtype=jnp.float32),  # 添加profile特征
+        'profile_with_prior': jnp.zeros((size, 21), dtype=jnp.float32),
+        'profile_prob': jnp.ones((size,), dtype=jnp.float32),
         
         # 序列特征
         'seq_mask': jnp.ones((size,), dtype=jnp.float32),
@@ -761,6 +764,12 @@ def create_dummy_batch(size: int) -> features.BatchDict:
         'cluster_bias_mask': jnp.ones((1, size), dtype=jnp.float32),
         'deletion_matrix': jnp.zeros((1, size), dtype=jnp.float32),
         'deletion_mean': jnp.zeros((size,), dtype=jnp.float32),
+        
+        # MSA统计特征
+        'extra_msa': jnp.zeros((1, size), dtype=jnp.int32),
+        'extra_msa_mask': jnp.ones((1, size), dtype=jnp.float32),
+        'extra_msa_row_mask': jnp.ones((1,), dtype=jnp.float32),
+        'extra_deletion_matrix': jnp.zeros((1, size), dtype=jnp.float32),
     }
     
     # 添加pair特征
