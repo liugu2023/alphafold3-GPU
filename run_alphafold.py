@@ -649,24 +649,65 @@ def benchmark_batch_size(
     try:
         # 准备测试批次
         test_examples = examples[:batch_size]
-        test_seeds = [i for i in range(batch_size)]
+        test_seeds = list(range(batch_size))
         
-        # 创建批量随机密钥
-        rng_keys = jnp.stack([jax.random.PRNGKey(seed) for seed in test_seeds])
-        
-        # 堆叠样本
+        # 将所有输入转换为device arrays
+        def convert_to_jax(x):
+            if isinstance(x, np.ndarray):
+                return jax.device_put(x)
+            return x
+            
+        # 转换examples中的所有numpy数组为jax数组
         try:
             from jax import tree
-            tree_map_fn = tree.map
+            test_examples = [
+                tree.map(convert_to_jax, example)
+                for example in test_examples
+            ]
+            
+            # 创建批量随机密钥并确保在设备上
+            rng_keys = jax.device_put(
+                jnp.stack([jax.random.PRNGKey(seed) for seed in test_seeds])
+            )
+            
+            # 堆叠并转换为device arrays
+            batched_examples = tree.map(
+                lambda *x: jax.device_put(jnp.stack(x)),
+                *test_examples
+            )
         except ImportError:
             from jax import tree_util
-            tree_map_fn = tree_util.tree_map
+            test_examples = [
+                tree_util.tree_map(convert_to_jax, example)
+                for example in test_examples
+            ]
             
-        batched_examples = tree_map_fn(lambda *x: jnp.stack(x), *test_examples)
+            # 创建批量随机密钥并确保在设备上
+            rng_keys = jax.device_put(
+                jnp.stack([jax.random.PRNGKey(seed) for seed in test_seeds])
+            )
+            
+            # 堆叠并转换为device arrays
+            batched_examples = tree_util.tree_map(
+                lambda *x: jax.device_put(jnp.stack(x)),
+                *test_examples
+            )
+        
+        # 使用jit包装的推理函数
+        @functools.partial(
+            jax.jit,
+            static_argnames=['batch_size'],  # 标记batch_size为静态参数
+        )
+        def batched_inference(batched_examples, rng_keys, batch_size):
+            return model_runner.run_inference(batched_examples, rng_keys)
         
         # 测试推理时间
         start_time = time.time()
-        model_runner.run_inference(batched_examples, rng_keys)
+        batched_inference(
+            batched_examples,
+            rng_keys,
+            batch_size=batch_size
+        )
         end_time = time.time()
         
         # 计算每个样本的平均处理时间
